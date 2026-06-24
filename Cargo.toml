@@ -1,0 +1,18 @@
+[package]
+name = "nanorts"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny hand-crafted RTS in a teacup — a complete real-time strategy game written from scratch in Rust."
+license = "MIT"
+
+[dependencies]
+minifb = "0.27"
+cpal = "0.15"
+
+# Honor the 60kb micro-game spirit: small, fast, no fat.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

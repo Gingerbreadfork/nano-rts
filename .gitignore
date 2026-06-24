@@ -1,0 +1,11 @@
+/target
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
