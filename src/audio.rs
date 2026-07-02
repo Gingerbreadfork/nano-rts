@@ -141,8 +141,12 @@ impl Voice {
         let n = self.noise_sample();
         let body = osc * (1.0 - self.noise) + n * self.noise;
         let env = (self.t / self.atk).min(1.0) * (-self.decay * self.t).exp();
+        // Slow-decay voices (Alarm ends near 37% of peak) would otherwise be
+        // cut mid-swing at t == dur — an audible click. A ~3 ms linear release
+        // ramps every voice to exactly zero at its end.
+        let rel = ((self.dur - self.t) * (1.0 / 0.003)).clamp(0.0, 1.0);
         self.t += dt;
-        body * self.amp0 * env
+        body * self.amp0 * env * rel
     }
 
     #[inline]
@@ -171,10 +175,19 @@ impl Audio {
         let config = supported.config();
         let queue: Arc<Mutex<VecDeque<Cue>>> = Arc::new(Mutex::new(VecDeque::new()));
 
+        // Cover every format the generic synth can render into — some devices
+        // default to I32 or F64, and matching only three would leave them mute.
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => build::<f32>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::F64 => build::<f64>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::I8 => build::<i8>(&device, &config, sr, channels, queue.clone()),
             cpal::SampleFormat::I16 => build::<i16>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::I32 => build::<i32>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::I64 => build::<i64>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::U8 => build::<u8>(&device, &config, sr, channels, queue.clone()),
             cpal::SampleFormat::U16 => build::<u16>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::U32 => build::<u32>(&device, &config, sr, channels, queue.clone()),
+            cpal::SampleFormat::U64 => build::<u64>(&device, &config, sr, channels, queue.clone()),
             _ => None,
         }?;
         stream.play().ok()?;
@@ -205,18 +218,25 @@ fn build<T>(
 where
     T: SizedSample + FromSample<f32>,
 {
-    let mut voices: Vec<Voice> = Vec::new();
+    // How many voices may sound at once; the oldest is evicted past this.
+    const MAX_VOICES: usize = 48;
+    // The callback runs on the real-time audio thread, so the pool is sized
+    // up front — pushing must never reallocate (malloc there risks underruns).
+    let mut voices: Vec<Voice> = Vec::with_capacity(MAX_VOICES);
     let mut seed: u32 = 0x9E37_79B9;
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                if let Ok(mut q) = queue.lock() {
+                // Never block the audio thread on the game thread: if the queue
+                // is contended right now, skip draining — cues stay put and the
+                // next callback picks them up, while live voices keep playing.
+                if let Ok(mut q) = queue.try_lock() {
                     while let Some((s, gain, pan)) = q.pop_front() {
-                        voices.push(Voice::spawn(s, sr, &mut seed, gain, pan));
-                        if voices.len() > 48 {
+                        if voices.len() >= MAX_VOICES {
                             voices.remove(0);
                         }
+                        voices.push(Voice::spawn(s, sr, &mut seed, gain, pan));
                     }
                 }
                 let stereo = channels >= 2;
@@ -249,4 +269,43 @@ where
             None,
         )
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_voice_releases_to_silence() {
+        // A voice cut while its envelope is still large is a hard step in the
+        // output — an audible click. The release ramp must bring the very last
+        // sample of every sound essentially to zero, Alarm especially (its
+        // slow decay leaves it near 37% of peak at t == dur).
+        let sr = 48_000.0;
+        for sfx in [
+            Sfx::Shot,
+            Sfx::TankShot,
+            Sfx::Flame,
+            Sfx::Explosion,
+            Sfx::BigBoom,
+            Sfx::Build,
+            Sfx::Train,
+            Sfx::Alarm,
+            Sfx::Select,
+        ] {
+            let mut seed = 0x1234_5678u32;
+            let mut v = Voice::spawn(sfx, sr, &mut seed, 1.0, 0.0);
+            let mut peak = 0.0f32;
+            let mut last = 0.0f32;
+            while !v.done() {
+                last = v.next();
+                peak = peak.max(last.abs());
+            }
+            assert!(peak > 0.01, "voice should be audible at its peak");
+            assert!(
+                last.abs() < 0.005,
+                "voice must end at silence, got {last} (peak {peak})"
+            );
+        }
+    }
 }

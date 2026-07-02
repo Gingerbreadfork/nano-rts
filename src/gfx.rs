@@ -56,15 +56,6 @@ impl Canvas {
         }
     }
 
-    /// Alpha-blended pixel. `a` in 0..=1.
-    #[inline]
-    pub fn blend(&mut self, x: i32, y: i32, color: u32, a: f32) {
-        if x >= 0 && y >= 0 && x < self.w && y < self.h {
-            let i = (y * self.w + x) as usize;
-            self.buf[i] = mix(self.buf[i], color, a);
-        }
-    }
-
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32) {
         let x0 = x.max(0);
         let y0 = y.max(0);
@@ -78,14 +69,36 @@ impl Canvas {
         }
     }
 
+    /// Alpha-blended fill. This runs over full-screen spans every frame (fog
+    /// cells, damage flash, pause dim), so it blends in fixed point: alpha is
+    /// quantised to 0..=256 once, the rect is clamped once, and the inner loop
+    /// is three integer lerps per pixel with no bounds checks. May differ from
+    /// the float `mix` path by at most 1/255 per channel.
     pub fn fill_rect_a(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, a: f32) {
         let x0 = x.max(0);
         let y0 = y.max(0);
         let x1 = (x + w).min(self.w);
         let y1 = (y + h).min(self.h);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        // 256 (not 255) so a == 1.0 replaces the background exactly via >> 8.
+        let ai = (a.clamp(0.0, 1.0) * 256.0 + 0.5) as u32;
+        if ai == 0 {
+            return;
+        }
+        let inv = 256 - ai;
+        let fr = ((color >> 16) & 0xFF) * ai;
+        let fg = ((color >> 8) & 0xFF) * ai;
+        let fb = (color & 0xFF) * ai;
         for yy in y0..y1 {
-            for xx in x0..x1 {
-                self.blend(xx, yy, color, a);
+            let row = (yy * self.w) as usize;
+            for px in self.buf[row + x0 as usize..row + x1 as usize].iter_mut() {
+                let bg = *px;
+                let r = (((bg >> 16) & 0xFF) * inv + fr) >> 8;
+                let g = (((bg >> 8) & 0xFF) * inv + fg) >> 8;
+                let b = ((bg & 0xFF) * inv + fb) >> 8;
+                *px = 0xFF00_0000 | (r << 16) | (g << 8) | b;
             }
         }
     }
@@ -118,17 +131,36 @@ impl Canvas {
         }
     }
 
+    /// Additive blend into an already-validated buffer index. The span
+    /// fillers below clip once per row and then call this in their inner
+    /// loops, skipping the per-pixel bounds check `add_px` pays.
+    #[inline]
+    fn add_at(&mut self, i: usize, color: u32, t: f32) {
+        let bg = self.buf[i];
+        let r = (((bg >> 16) & 0xFF) as f32 + ((color >> 16) & 0xFF) as f32 * t).min(255.0) as u32;
+        let g = (((bg >> 8) & 0xFF) as f32 + ((color >> 8) & 0xFF) as f32 * t).min(255.0) as u32;
+        let b = ((bg & 0xFF) as f32 + (color & 0xFF) as f32 * t).min(255.0) as u32;
+        self.buf[i] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+    }
+
     /// Additive pixel: adds `color * t` to whatever's there (clamped). Lets
     /// overlapping glow particles stack and blow out to white.
     #[inline]
     pub fn add_px(&mut self, x: i32, y: i32, color: u32, t: f32) {
         if x >= 0 && y >= 0 && x < self.w && y < self.h {
-            let i = (y * self.w + x) as usize;
-            let bg = self.buf[i];
-            let r = (((bg >> 16) & 0xFF) as f32 + ((color >> 16) & 0xFF) as f32 * t).min(255.0) as u32;
-            let g = (((bg >> 8) & 0xFF) as f32 + ((color >> 8) & 0xFF) as f32 * t).min(255.0) as u32;
-            let b = ((bg & 0xFF) as f32 + (color & 0xFF) as f32 * t).min(255.0) as u32;
-            self.buf[i] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            self.add_at((y * self.w + x) as usize, color, t);
+        }
+    }
+
+    /// Additive horizontal run, clamped to the canvas. `y` must already be
+    /// on-screen; x0..=x1 may hang off either edge.
+    #[inline]
+    fn add_span(&mut self, x0: i32, x1: i32, y: i32, color: u32, t: f32) {
+        let x0 = x0.max(0);
+        let x1 = x1.min(self.w - 1);
+        let row = y * self.w;
+        for xx in x0..=x1 {
+            self.add_at((row + xx) as usize, color, t);
         }
     }
 
@@ -145,13 +177,13 @@ impl Canvas {
                 continue;
             }
             let span = ((r2 - dy * dy) as f32).sqrt() as i32;
-            for xx in (cx - span)..=(cx + span) {
-                self.add_px(xx, yy, color, t);
-            }
+            self.add_span(cx - span, cx + span, yy, color, t);
         }
     }
 
-    /// Additive ring (annulus between `r0` and `r1`) — a shockwave.
+    /// Additive ring (annulus between `r0` and `r1`) — a shockwave. Each row
+    /// is at most two horizontal runs (the ring's left and right arcs), so we
+    /// walk only those instead of testing the whole bounding square.
     pub fn ring_add(&mut self, cx: i32, cy: i32, r0: i32, r1: i32, color: u32, t: f32) {
         let r1 = r1.max(r0 + 1);
         let (o0, o1) = (r0 * r0, r1 * r1);
@@ -160,11 +192,25 @@ impl Canvas {
             if yy < 0 || yy >= self.h {
                 continue;
             }
-            for dx in -r1..=r1 {
-                let d2 = dx * dx + dy * dy;
-                if d2 >= o0 && d2 <= o1 {
-                    self.add_px(cx + dx, yy, color, t);
+            // Outer edge: widest |dx| with dx² + dy² <= o1.
+            let out = ((o1 - dy * dy) as f32).sqrt() as i32;
+            // Inner hole: widest |dx| with dx² + dy² < o0, or none if the row
+            // sits entirely at or beyond the inner radius.
+            let k = o0 - dy * dy;
+            let hole = if k > 0 {
+                let mut s = (k as f32).sqrt() as i32;
+                if s * s >= k {
+                    s -= 1; // dx = s lands on the ring itself, not the hole
                 }
+                s
+            } else {
+                -1
+            };
+            if hole < 0 {
+                self.add_span(cx - out, cx + out, yy, color, t);
+            } else {
+                self.add_span(cx - out, cx - hole - 1, yy, color, t);
+                self.add_span(cx + hole + 1, cx + out, yy, color, t);
             }
         }
     }
@@ -285,6 +331,7 @@ impl Canvas {
             return;
         }
         let steps = len as i32;
+        let dash = dash.max(1); // a zero dash would divide by zero below
         for i in 0..=steps {
             if (i / dash) % 2 == 0 {
                 let t = i as f32 / steps as f32;
@@ -335,5 +382,100 @@ impl Canvas {
     pub fn text_center(&mut self, cx: i32, y: i32, s: &str, color: u32, scale: i32) {
         let w = Canvas::text_width(s, scale);
         self.text_sh(cx - w / 2, y, s, color, scale);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashed_line_tolerates_zero_dash() {
+        let mut c = Canvas::new(32, 32);
+        // A zero dash length must not divide by zero; it degrades to solid.
+        c.dashed_line(0, 0, 20, 10, rgb(255, 0, 0), 0);
+        assert_eq!(c.buf[0], rgb(255, 0, 0));
+    }
+
+    /// Brute-force additive ring, pixel-tested over the whole bounding square
+    /// — the shape the span version must reproduce exactly.
+    fn ring_add_ref(c: &mut Canvas, cx: i32, cy: i32, r0: i32, r1: i32, color: u32, t: f32) {
+        let r1 = r1.max(r0 + 1);
+        let (o0, o1) = (r0 * r0, r1 * r1);
+        for dy in -r1..=r1 {
+            for dx in -r1..=r1 {
+                let d2 = dx * dx + dy * dy;
+                if d2 >= o0 && d2 <= o1 {
+                    c.add_px(cx + dx, cy + dy, color, t);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ring_add_matches_per_pixel_reference() {
+        // Include rings hanging off every edge and degenerate radii.
+        for &(cx, cy, r0, r1) in &[
+            (16, 16, 4, 7),
+            (16, 16, 0, 5),
+            (16, 16, 5, 5), // r1 clamps up to r0 + 1
+            (-2, 3, 3, 8),
+            (31, 31, 2, 9),
+            (16, -5, 4, 12),
+        ] {
+            let mut a = Canvas::new(32, 32);
+            let mut b = Canvas::new(32, 32);
+            a.ring_add(cx, cy, r0, r1, rgb(200, 120, 40), 0.7);
+            ring_add_ref(&mut b, cx, cy, r0, r1, rgb(200, 120, 40), 0.7);
+            assert_eq!(a.buf, b.buf, "ring ({cx},{cy}) r{r0}..r{r1} diverged");
+        }
+    }
+
+    #[test]
+    fn fill_circle_add_clips_offscreen_spans() {
+        // Rows overhang both horizontal edges; must match the checked path.
+        for &(cx, cy) in &[(1, 10), (30, 10), (-3, 5), (34, 20)] {
+            let mut a = Canvas::new(32, 32);
+            let mut b = Canvas::new(32, 32);
+            a.fill_circle_add(cx, cy, 6, rgb(90, 200, 250), 0.5);
+            let r2 = 36;
+            for dy in -6..=6i32 {
+                let yy = cy + dy;
+                let span = ((r2 - dy * dy) as f32).sqrt() as i32;
+                for xx in (cx - span)..=(cx + span) {
+                    b.add_px(xx, yy, rgb(90, 200, 250), 0.5);
+                }
+            }
+            assert_eq!(a.buf, b.buf, "circle at ({cx},{cy}) diverged");
+        }
+    }
+
+    #[test]
+    fn fill_rect_a_tracks_float_mix_within_one_step() {
+        let bg = rgb(37, 91, 143);
+        let fg = rgb(240, 180, 20);
+        for &a in &[0.0f32, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            let mut c = Canvas::new(8, 8);
+            c.clear(bg);
+            // Deliberately overhang all four edges to exercise the clamp.
+            c.fill_rect_a(-4, -4, 16, 16, fg, a);
+            let want = mix(bg, fg, a);
+            let got = c.buf[0];
+            for shift in [16u32, 8, 0] {
+                let w = (want >> shift) & 0xFF;
+                let g = (got >> shift) & 0xFF;
+                assert!(
+                    (w as i32 - g as i32).abs() <= 1,
+                    "alpha {a}: channel {shift} off by more than 1 ({w} vs {g})"
+                );
+            }
+        }
+        // The endpoints must be exact: 0 leaves the buffer alone, 1 replaces.
+        let mut c = Canvas::new(4, 4);
+        c.clear(bg);
+        c.fill_rect_a(0, 0, 4, 4, fg, 0.0);
+        assert_eq!(c.buf[5], bg);
+        c.fill_rect_a(0, 0, 4, 4, fg, 1.0);
+        assert_eq!(c.buf[5], fg);
     }
 }

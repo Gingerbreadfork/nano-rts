@@ -5,7 +5,7 @@
 //! only knows how to *be*, not how to look.
 
 use crate::audio::Sfx;
-use crate::vec::{v2, V2};
+use crate::vec::{det_cos, det_sin, v2, V2};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -107,6 +107,9 @@ pub enum Cmd {
     Build { worker: u32, kind: Kind, x: f32, y: f32, chain: bool },
     Rally { building: u32, x: f32, y: f32 },
     Cancel { building: u32 },
+    /// The acting faction concedes: every building it owns is razed, which
+    /// eliminates it through the normal building-loss rule on every peer.
+    Surrender,
 }
 
 pub struct Ent {
@@ -135,6 +138,10 @@ pub struct Ent {
     pub build_left: f32,      // >0 while a building is still being assembled
     pub path: Vec<V2>,        // remaining pathfinding waypoints toward the goal
     pub repath: f32,          // countdown to the next path recompute
+    // Seconds a builder has spent walking toward its site; every few seconds
+    // it probes reachability and gives up (with a refund) if walled off.
+    // Deterministic (pure sim state) but NOT checksummed — like `repath`.
+    pub build_stall: f32,
 }
 
 pub struct Tracer {
@@ -191,7 +198,6 @@ pub enum Strategy {
 pub struct AiState {
     pub think: f32,
     pub staging: V2,    // where forces gather between attacks
-    pub expanded: bool,
     // Rolled per match (see World::roll_ai):
     pub strategy: Strategy,
     pub worker_target: u32, // workers to saturate to (per base)
@@ -222,7 +228,6 @@ impl AiState {
         AiState {
             think: 0.0,
             staging: v2(0.0, 0.0),
-            expanded: false,
             strategy: Strategy::Standard,
             worker_target: 12,
             tank_ratio: 0.3,
@@ -309,6 +314,10 @@ pub struct World {
     pub ai: Vec<AiState>, // one AI brain per faction (only AI factions act)
     pub attack_warn: f32,
     pub kills: u32,
+    /// Last-known enemy buildings for the LOCAL viewer's fog memory (drawn as
+    /// ghosts where the fog has gone stale). Per-viewer, keyed to `my_team`,
+    /// so it is NOT checksummed and must never feed a sim decision.
+    pub seen_buildings: Vec<(V2, Kind, Team)>,
 }
 
 // ---- per-kind stats -------------------------------------------------------
@@ -634,6 +643,7 @@ impl World {
             ai: (0..factions).map(|_| AiState::fresh()).collect(),
             attack_warn: 0.0,
             kills: 0,
+            seen_buildings: Vec::new(),
         };
         w.setup();
         w
@@ -730,7 +740,9 @@ impl World {
     fn mineral_field(&mut self, center: V2, n: i32) {
         for i in 0..n {
             let ang = (i as f32 / n as f32) * std::f32::consts::TAU;
-            let p = center.add(v2(ang.cos() * 70.0, ang.sin() * 46.0));
+            // Patch positions are checksummed sim state, so the ring must use
+            // deterministic trig — platform libm cos/sin differs across OSes.
+            let p = center.add(v2(det_cos(ang) * 70.0, det_sin(ang) * 46.0));
             let idx = self.spawn(Kind::Mineral, Team::Neutral, p);
             self.ents[idx].minerals = MINERAL_START;
         }
@@ -851,6 +863,7 @@ impl World {
             build_left: 0.0,
             path: Vec::new(),
             repath: 0.0,
+            build_stall: 0.0,
         });
         self.ents.len() - 1
     }
@@ -871,13 +884,14 @@ impl World {
         self.nearest_mineral(p)
     }
 
-    /// Position of the nearest enemy within `r` of `pt`, if any. Lets minimap
-    /// attack-clicks snap onto a target without pixel-perfect aim.
+    /// Position of the nearest entity hostile to the local player within `r`
+    /// of `pt`, if any. Lets minimap attack-clicks snap onto a target without
+    /// pixel-perfect aim — any rival faction counts, not just faction 1.
     pub fn snap_to_enemy(&self, pt: V2, r: f32) -> Option<V2> {
         let mut best = None;
         let mut bd = r * r;
         for e in &self.ents {
-            if e.team != Team::Enemy || e.hp <= 0.0 {
+            if e.team == self.my_team || e.team == Team::Neutral || e.hp <= 0.0 {
                 continue;
             }
             let d = e.pos.dist_sq(pt);
@@ -890,7 +904,12 @@ impl World {
     }
 
     /// Is a building footprint clear (in-bounds and not overlapping solids)?
-    pub fn can_build(&self, kind: Kind, pt: V2) -> bool {
+    /// The pending-build overlap scan only consults workers of `team`: reading
+    /// rival factions' unreached sites would leak fogged intel through the
+    /// placement ghost, and a sim path keyed to my_team would desync. `ignore`
+    /// skips one worker's own plan — used by the raise-time revalidation,
+    /// where the arriving builder's active order is the site itself.
+    fn can_build_at(&self, team: Team, kind: Kind, pt: V2, ignore: Option<usize>) -> bool {
         let r = radius(kind);
         if pt.x < r || pt.y < r || pt.x > self.world_w - r || pt.y > self.world_h - r {
             return false;
@@ -917,9 +936,11 @@ impl World {
         }
         // Also stay clear of buildings ordered but not yet raised — a worker's
         // active build site and any chained ones it has queued — so chained
-        // placements (and the AI's own pending builds) never overlap.
-        for e in &self.ents {
-            if e.kind != Kind::Worker {
+        // placements (and the AI's own pending builds) never overlap. Only OUR
+        // OWN faction's plans count; rival sites are invisible here and any
+        // cross-team collision is resolved at raise time instead.
+        for (wi, e) in self.ents.iter().enumerate() {
+            if e.kind != Kind::Worker || e.team != team || Some(wi) == ignore {
                 continue;
             }
             if let Order::Build(bk, site) = e.order {
@@ -936,16 +957,29 @@ impl World {
         true
     }
 
+    /// Footprint check as faction `team` sees it — the form every SIM caller
+    /// must use, with the acting team.
+    pub fn can_build_team(&self, team: Team, kind: Kind, pt: V2) -> bool {
+        self.can_build_at(team, kind, pt, None)
+    }
+
+    /// The local player's view of a footprint — for the UI placement ghost
+    /// only (render path; my_team-dependent, so never call it from the sim).
+    pub fn can_build(&self, kind: Kind, pt: V2) -> bool {
+        self.can_build_team(self.my_team, kind, pt)
+    }
+
     /// Building placement: spend, validate spacing, send the worker. Replaces any
     /// in-progress build chain (a plain, single build).
     pub fn order_build(&mut self, worker_idx: usize, kind: Kind, site: V2) -> bool {
         let team = self.ents[worker_idx].team;
-        if self.team_min(team) < cost(kind) || !self.can_build(kind, site) {
+        if self.team_min(team) < cost(kind) || !self.can_build_team(team, kind, site) {
             return false;
         }
         self.spend(team, cost(kind));
         self.ents[worker_idx].build_queue.clear();
         self.ents[worker_idx].order = Order::Build(kind, site);
+        self.ents[worker_idx].build_stall = 0.0;
         true
     }
 
@@ -954,7 +988,7 @@ impl World {
     /// the worker isn't already building.
     pub fn queue_build(&mut self, worker_idx: usize, kind: Kind, site: V2) -> bool {
         let team = self.ents[worker_idx].team;
-        if self.team_min(team) < cost(kind) || !self.can_build(kind, site) {
+        if self.team_min(team) < cost(kind) || !self.can_build_team(team, kind, site) {
             return false;
         }
         self.spend(team, cost(kind));
@@ -964,6 +998,7 @@ impl World {
             self.ents[worker_idx].build_queue.push((kind, site));
         } else {
             self.ents[worker_idx].order = Order::Build(kind, site);
+            self.ents[worker_idx].build_stall = 0.0;
         }
         true
     }
@@ -981,6 +1016,7 @@ impl World {
             refund += cost(k);
         }
         self.ents[i].build_queue.clear();
+        self.ents[i].build_stall = 0.0;
         if refund > 0 {
             self.gain(team, refund);
         }
@@ -1069,7 +1105,7 @@ impl World {
         let mut best = None;
         let mut bd = f32::MAX;
         for (i, e) in self.ents.iter().enumerate() {
-            if e.kind != Kind::Base || e.team != team {
+            if e.kind != Kind::Base || e.team != team || e.build_left > 0.0 {
                 continue;
             }
             let d = e.pos.dist_sq(p);
@@ -1131,9 +1167,25 @@ impl World {
         cap.min(120)
     }
 
+    /// What each producer may train. This is a TRUST BOUNDARY: a Train command
+    /// arrives off the wire with any building/unit pairing a hacked client
+    /// cares to send, so the pairing is enforced inside `try_train` — the one
+    /// choke point every trainer (UI, AI, network) goes through.
+    fn can_train(producer: Kind, unit: Kind) -> bool {
+        match producer {
+            Kind::Base => unit == Kind::Worker,
+            Kind::Barracks => matches!(unit, Kind::Soldier | Kind::Pyro | Kind::Sapper),
+            Kind::Factory => matches!(unit, Kind::Tank | Kind::Raider | Kind::Mortar),
+            _ => false,
+        }
+    }
+
     /// Queue a unit at a building if affordable (minerals + supply). Returns success.
     pub fn try_train(&mut self, bidx: usize, kind: Kind) -> bool {
         let team = self.ents[bidx].team;
+        if !World::can_train(self.ents[bidx].kind, kind) {
+            return false;
+        }
         let c = cost(kind);
         if self.team_min(team) < c {
             if team == self.my_team {
@@ -1395,9 +1447,11 @@ impl World {
                 // Always append onto the worker's build chain (it starts straight
                 // away if idle). A placement never clears an existing queue, so you
                 // can finish placing, click away, or deselect and the worker still
-                // raises everything it was told to.
+                // raises everything it was told to. Only real building kinds
+                // pass: a forged Build carrying a unit kind would otherwise
+                // raise a "Tank building" that pops out as a full tank.
                 if let Some(i) = self.index_of(*worker) {
-                    if self.ents[i].team == team && self.ents[i].kind == Kind::Worker {
+                    if self.ents[i].team == team && self.ents[i].kind == Kind::Worker && is_building(*kind) {
                         self.queue_build(i, *kind, v2(*x, *y));
                     }
                 }
@@ -1418,6 +1472,16 @@ impl World {
                             self.ents[i].train_timer = 0.0;
                         }
                         self.gain(team, cost(k));
+                    }
+                }
+            }
+            Cmd::Surrender => {
+                // Raze the acting faction's buildings: the standard building-loss
+                // rule then eliminates it on every peer (explosions and
+                // check_over included), instead of only flipping a local overlay.
+                for e in self.ents.iter_mut() {
+                    if e.team == team && is_building(e.kind) {
+                        e.hp = -1.0;
                     }
                 }
             }
@@ -1469,11 +1533,15 @@ impl World {
         }
 
         let tinfo = target.map(|i| (self.ents[i].id, self.ents[i].team, self.ents[i].kind));
-        // A friendly, damaged building the click landed on — a repair target.
+        // A friendly, damaged, FINISHED building the click landed on — a repair
+        // target. A construction site is excluded: its build cost was already
+        // paid and its hp comes from the build ramp, so "repairing" it would
+        // burn minerals for nothing.
         let repair_id = target
             .filter(|&ti| {
                 self.ents[ti].team == team
                     && is_building(self.ents[ti].kind)
+                    && self.ents[ti].build_left <= 0.0
                     && self.ents[ti].hp < self.ents[ti].max_hp
             })
             .map(|ti| self.ents[ti].id);
@@ -2406,7 +2474,7 @@ impl World {
         }
 
         self.production(dt);
-        let mut dmg: Vec<(usize, f32)> = Vec::new();
+        let mut dmg: Vec<(usize, f32, Team)> = Vec::new();
         self.decide(dt, &mut dmg);
         self.apply_damage(&mut dmg);
         self.rebuild_block_grid(); // buildings may have spawned this tick
@@ -2415,22 +2483,57 @@ impl World {
         self.decay(dt);
         self.update_particles(dt);
         self.update_fog();
+        self.update_seen_buildings();
         self.check_over();
+    }
+
+    /// The local viewer's fog memory of enemy buildings: remember every one
+    /// currently in sight, forget any remembered spot we can SEE is now bare.
+    /// Render-side only — per-viewer (my_team), never a sim input.
+    fn update_seen_buildings(&mut self) {
+        const NEAR2: f32 = 4.0 * 4.0;
+        let standing: Vec<(V2, Kind, Team)> = self
+            .ents
+            .iter()
+            .filter(|e| {
+                is_building(e.kind) && e.hp > 0.0 && e.team != self.my_team && e.team != Team::Neutral
+            })
+            .map(|e| (e.pos, e.kind, e.team))
+            .collect();
+        // Split the memory out so we can consult vis_at while editing it.
+        let mut seen = std::mem::take(&mut self.seen_buildings);
+        seen.retain(|&(p, k, t)| {
+            self.vis_at(p) != 2
+                || standing.iter().any(|&(q, qk, qt)| qk == k && qt == t && q.dist_sq(p) < NEAR2)
+        });
+        for &(p, k, t) in &standing {
+            if self.vis_at(p) == 2 && !seen.iter().any(|&(q, _, _)| q.dist_sq(p) < NEAR2) {
+                seen.push((p, k, t));
+            }
+        }
+        while seen.len() > 128 {
+            seen.remove(0); // bounded memory: the oldest sighting goes first
+        }
+        self.seen_buildings = seen;
     }
 
     fn production(&mut self, dt: f32) {
         let n = self.ents.len();
         for i in 0..n {
-            // Construction ramp for buildings being assembled.
+            // Construction ramp for buildings being assembled. The shell starts
+            // at 12% hp and the remaining 88% accrues INCREMENTALLY over the
+            // build time — never assigned from the ramp — so damage dealt to a
+            // rising site sticks, and sustained fire that outpaces the accrual
+            // destroys it (hp <= 0 dies via cleanup as usual). Completion does
+            // not snap hp to max either; battle scars survive the ribbon-cutting.
             if self.ents[i].build_left > 0.0 {
                 let k = self.ents[i].kind;
                 let total = build_time(k);
                 self.ents[i].build_left -= dt;
-                let prog = 1.0 - (self.ents[i].build_left / total).clamp(0.0, 1.0);
-                self.ents[i].hp = self.ents[i].max_hp * (0.12 + 0.88 * prog);
+                let mh = self.ents[i].max_hp;
+                self.ents[i].hp = (self.ents[i].hp + mh * 0.88 * (dt / total)).min(mh);
                 if self.ents[i].build_left <= 0.0 {
                     self.ents[i].build_left = 0.0;
-                    self.ents[i].hp = self.ents[i].max_hp;
                     let bp = self.ents[i].pos;
                     self.emit(bp, crate::gfx::rgb(200, 195, 180), 18, 110.0, 3.2, 0.6, -25.0, 2.0, false);
                     self.emit(bp, crate::gfx::rgb(150, 230, 170), 8, 90.0, 2.0, 0.4, -10.0, 4.0, true);
@@ -2480,8 +2583,13 @@ impl World {
                 if team == self.my_team {
                     self.msg(match front {
                         Kind::Worker => "WORKER READY",
+                        Kind::Soldier => "SOLDIER READY",
                         Kind::Tank => "TANK READY",
-                        _ => "SOLDIER READY",
+                        Kind::Pyro => "PYRO READY",
+                        Kind::Raider => "RAIDER READY",
+                        Kind::Mortar => "MORTAR READY",
+                        Kind::Sapper => "SAPPER READY",
+                        _ => "UNIT READY",
                     });
                     self.sfx_at(Sfx::Train, bpos);
                 }
@@ -2489,7 +2597,9 @@ impl World {
         }
     }
 
-    fn decide(&mut self, dt: f32, dmg: &mut Vec<(usize, f32)>) {
+    // `dmg` carries (victim index, amount, attacker team) — the attacker tag
+    // exists solely so apply_damage can credit the local player's kills.
+    fn decide(&mut self, dt: f32, dmg: &mut Vec<(usize, f32, Team)>) {
         let n = self.ents.len();
         for i in 0..n {
             if self.ents[i].cooldown > 0.0 {
@@ -2554,7 +2664,7 @@ impl World {
                             }
                             let dd = e.pos.dist_sq(pos);
                             if dd <= b2 {
-                                dmg.push((k2, bd * (1.0 - 0.55 * (dd / b2))));
+                                dmg.push((k2, bd * (1.0 - 0.55 * (dd / b2)), team));
                             }
                         }
                         self.ents[i].hp = 0.0;
@@ -2578,7 +2688,7 @@ impl World {
                                 }
                                 let n = to.norm();
                                 if n.x * dir.x + n.y * dir.y >= cone_cos || d2 < 1.0 {
-                                    dmg.push((k2, dm));
+                                    dmg.push((k2, dm, team));
                                 }
                             }
                             let nozzle = pos.add(dir.scale(radius(kind) + 3.0));
@@ -2599,11 +2709,11 @@ impl World {
                                         && e.team != Team::Neutral
                                         && e.pos.dist_sq(tpos) <= sp2
                                     {
-                                        dmg.push((k2, dm));
+                                        dmg.push((k2, dm, team));
                                     }
                                 }
                             } else {
-                                dmg.push((j, dm));
+                                dmg.push((j, dm, team));
                             }
                             if is_combat(kind) {
                                 // Tracer-firing weapons: soldier rifle, tank cannon, raider gun.
@@ -2679,13 +2789,28 @@ impl World {
                 Order::Repair(bid) => self.run_repair(i, bid, dt),
                 Order::Build(bk, site) => {
                     if pos.dist(site) <= radius(bk) + radius(kind) + 6.0 {
-                        // Raise the building in construction state.
-                        let bi = self.spawn(bk, team, site);
-                        self.ents[bi].build_left = build_time(bk);
-                        self.ents[bi].hp = self.ents[bi].max_hp * 0.12;
-                        self.ents[bi].rally = site.add(v2(0.0, radius(bk) + 30.0));
-                        // On to the next chained build, or back to mining.
+                        self.ents[i].build_stall = 0.0;
+                        // Revalidate the footprint at raise time: rival factions
+                        // can't see each other's pending sites, so another
+                        // builder may have raised here first. The check ignores
+                        // this worker's own plan — its active order IS the site.
+                        if !self.can_build_at(team, bk, site, Some(i)) {
+                            self.gain(team, cost(bk));
+                            if team == self.my_team {
+                                self.msg("BUILD SITE BLOCKED");
+                            }
+                        } else {
+                            // Raise the building in construction state.
+                            let bi = self.spawn(bk, team, site);
+                            self.ents[bi].build_left = build_time(bk);
+                            self.ents[bi].hp = self.ents[bi].max_hp * 0.12;
+                            self.ents[bi].rally = site.add(v2(0.0, radius(bk) + 30.0));
+                        }
+                        // On to the next chained build, or back to mining. Going
+                        // Idle first matters: with no patch left to gather, the
+                        // stale Build order would raise here again next tick.
                         if self.ents[i].build_queue.is_empty() {
+                            self.ents[i].order = Order::Idle;
                             self.auto_gather(i);
                         } else {
                             let (nk, ns) = self.ents[i].build_queue.remove(0);
@@ -2693,6 +2818,24 @@ impl World {
                         }
                     } else {
                         self.ents[i].goal = Some(site);
+                        // A site walled off after the order (or never reachable)
+                        // would otherwise lock the minerals and the worker
+                        // forever. Probe reachability every ~3 walked seconds —
+                        // driven purely by sim state, identical on every peer —
+                        // and give the whole plan up (with a refund) if severed.
+                        self.ents[i].build_stall += dt;
+                        if self.ents[i].build_stall >= 3.0 {
+                            self.ents[i].build_stall = 0.0;
+                            if self.find_path(pos, site).is_none() {
+                                self.cancel_builds(i);
+                                if team == self.my_team {
+                                    self.msg("BUILD SITE UNREACHABLE");
+                                }
+                                self.ents[i].order = Order::Idle;
+                                self.ents[i].goal = None;
+                                self.auto_gather(i);
+                            }
+                        }
                     }
                 }
                 Order::Idle => {}
@@ -2716,8 +2859,13 @@ impl World {
     fn run_repair(&mut self, i: usize, bid: u32, dt: f32) {
         let pos = self.ents[i].pos;
         let team = self.ents[i].team;
+        // A construction site never qualifies: its cost is already paid and its
+        // hp rides the build ramp, so repairing it would just burn minerals.
         let bi = self.index_of(bid).filter(|&b| {
-            self.ents[b].team == team && is_building(self.ents[b].kind) && self.ents[b].hp > 0.0
+            self.ents[b].team == team
+                && is_building(self.ents[b].kind)
+                && self.ents[b].build_left <= 0.0
+                && self.ents[b].hp > 0.0
         });
         let Some(bi) = bi else {
             self.advance_order(i);
@@ -2813,12 +2961,25 @@ impl World {
         }
     }
 
-    fn apply_damage(&mut self, dmg: &mut Vec<(usize, f32)>) {
-        for &(i, d) in dmg.iter() {
+    fn apply_damage(&mut self, dmg: &mut Vec<(usize, f32, Team)>) {
+        for &(i, d, from) in dmg.iter() {
             if i >= self.ents.len() {
                 continue;
             }
+            let was_alive = self.ents[i].hp > 0.0;
             self.ents[i].hp -= d;
+            // Score the kill for the HUD when the LOCAL player's fire lands the
+            // finishing blow on a rival mover. `kills` is per-viewer display
+            // state, never checksummed, so keying it to my_team is safe.
+            if was_alive
+                && self.ents[i].hp <= 0.0
+                && from == self.my_team
+                && self.ents[i].team != self.my_team
+                && self.ents[i].team != Team::Neutral
+                && is_mover(self.ents[i].kind)
+            {
+                self.kills += 1;
+            }
             self.ents[i].flash = 0.1;
             let pos = self.ents[i].pos;
             // Impact sparks at the point of contact.
@@ -2927,10 +3088,28 @@ impl World {
             .filter(|e| if e.kind == Kind::Mineral { e.minerals == 0 } else { e.hp <= 0.0 })
             .map(|e| (e.pos, e.kind, e.team))
             .collect();
-        self.kills += dying
-            .iter()
-            .filter(|(_, k, t)| *t == Team::Enemy && is_mover(*k))
-            .count() as u32;
+        // A worker dying with a build plan takes reserved minerals with it — the
+        // cost was spent up front at order time. Refund the active site and
+        // every chained one to its faction before the body is dropped.
+        let mut refunds = [0u32; MAX_FACTIONS];
+        for e in &self.ents {
+            if e.kind == Kind::Worker && e.hp <= 0.0 {
+                let fi = e.team.idx();
+                if fi < MAX_FACTIONS {
+                    if let Order::Build(k, _) = e.order {
+                        refunds[fi] += cost(k);
+                    }
+                    for &(k, _) in &e.build_queue {
+                        refunds[fi] += cost(k);
+                    }
+                }
+            }
+        }
+        for (fi, &r) in refunds.iter().enumerate() {
+            if r > 0 {
+                self.gain(Team::from_idx(fi), r);
+            }
+        }
         for (pos, kind, team) in dying {
             self.death_fx(pos, kind, team);
         }
@@ -3730,6 +3909,47 @@ mod tests {
     }
 
     #[test]
+    fn no_dropoff_at_a_base_under_construction() {
+        // Regression: nearest_base once returned construction sites, so a
+        // worker banked its load at an unfinished Command Center next door
+        // instead of hauling home.
+        let mut w = World::new(7);
+        w.flatten_terrain();
+        let base = w.first_base(Team::Player).unwrap();
+        // Raise a site 400 units toward the map centre and stand a loaded
+        // worker at its rim, well inside drop-off range.
+        let dir = v2(w.world_w / 2.0, w.world_h / 2.0).sub(w.ents[base].pos).norm();
+        let site_pos = w.ents[base].pos.add(dir.scale(400.0));
+        let site = w.spawn(Kind::Base, Team::Player, site_pos);
+        w.ents[site].build_left = 60.0;
+        let wk = w.spawn(
+            Kind::Worker,
+            Team::Player,
+            site_pos.add(dir.scale(radius(Kind::Base) + radius(Kind::Worker) + 2.0)),
+        );
+        let wid = w.ents[wk].id;
+        w.ents[wk].carry = CARRY;
+        w.ents[wk].order = Order::Gather(w.ents[site].id);
+        for _ in 0..60 {
+            w.update(1.0 / 60.0);
+        }
+        let wk = w.index_of(wid).unwrap();
+        assert_eq!(
+            w.ents[wk].carry,
+            CARRY,
+            "worker banked its load at an unfinished base"
+        );
+        // The trip home must still cash the load in at the finished base.
+        for _ in 0..(60 * 15) {
+            w.update(1.0 / 60.0);
+            if w.index_of(wid).is_none_or(|i| w.ents[i].carry == 0) {
+                return;
+            }
+        }
+        panic!("worker never delivered its load to the finished base");
+    }
+
+    #[test]
     fn starting_workers_fan_out_across_patches() {
         // The crew should spread over the home mineral line, not dog-pile the
         // single closest patch.
@@ -3751,6 +3971,327 @@ mod tests {
             targets.len() >= 3,
             "workers should fan out, but only {} distinct patches targeted",
             targets.len()
+        );
+    }
+
+    /// A quiet sandbox: two human factions, no AI brains, flat ground.
+    fn duel_sandbox(factions: usize) -> World {
+        let mut w = World::new_match(2, factions, [false, false, false, false], Team::Player, true);
+        w.flatten_terrain();
+        w
+    }
+
+    #[test]
+    fn construction_site_damage_persists_and_can_kill() {
+        let mut w = duel_sandbox(2);
+        let b = w.spawn(Kind::Depot, Team::Player, v2(1400.0, 900.0));
+        w.ents[b].build_left = build_time(Kind::Depot);
+        w.ents[b].hp = w.ents[b].max_hp * 0.12;
+        let bid = w.ents[b].id;
+        // The ramp accrues 0.88*400/6 ≈ 59 hp/s; 150 dps outpaces it easily.
+        for _ in 0..(60 * 8) {
+            if let Some(i) = w.index_of(bid) {
+                w.ents[i].hp -= 150.0 / 60.0;
+            } else {
+                break;
+            }
+            w.update(1.0 / 60.0);
+        }
+        assert!(
+            w.index_of(bid).is_none(),
+            "sustained fire beyond the build ramp must destroy the site"
+        );
+
+        // An untouched site still finishes at full health.
+        let mut w2 = duel_sandbox(2);
+        let b = w2.spawn(Kind::Depot, Team::Player, v2(1400.0, 900.0));
+        w2.ents[b].build_left = build_time(Kind::Depot);
+        w2.ents[b].hp = w2.ents[b].max_hp * 0.12;
+        let bid = w2.ents[b].id;
+        for _ in 0..(60 * 8) {
+            w2.update(1.0 / 60.0);
+        }
+        let i = w2.index_of(bid).expect("undamaged site survives construction");
+        assert!(w2.ents[i].build_left <= 0.0, "construction should be done");
+        assert!(
+            w2.ents[i].hp >= w2.ents[i].max_hp * 0.999,
+            "undamaged site should finish (approximately) whole (hp {})",
+            w2.ents[i].hp
+        );
+    }
+
+    #[test]
+    fn construction_sites_are_not_repair_targets() {
+        let mut w = duel_sandbox(2);
+        w.minerals[0] = 9999;
+        let b = w.spawn(Kind::Barracks, Team::Player, v2(1400.0, 900.0));
+        w.ents[b].build_left = 8.0;
+        w.ents[b].hp = w.ents[b].max_hp * 0.3;
+        let bid = w.ents[b].id;
+        let wi = a_player_worker(&w);
+        w.ents[wi].pos = v2(1440.0, 900.0);
+        let wid = w.ents[wi].id;
+        // Click resolution: a right-click on the rising shell must not read as
+        // a repair order.
+        w.apply_order(Team::Player, &[wid], w.ents[b].pos, false, false);
+        assert!(
+            !matches!(w.ents[wi].order, Order::Repair(_)),
+            "a construction site must not resolve as a repair target"
+        );
+        // And a Repair order forced onto a site is dropped by run_repair.
+        w.ents[wi].order = Order::Repair(bid);
+        let m0 = w.minerals[0];
+        w.update(1.0 / 60.0);
+        let wi = w.index_of(wid).unwrap();
+        assert!(
+            !matches!(w.ents[wi].order, Order::Repair(_)),
+            "run_repair must reject an in-progress site"
+        );
+        assert_eq!(w.minerals[0], m0, "no minerals may be burned on the site");
+    }
+
+    #[test]
+    fn trained_units_announce_their_own_name() {
+        let mut w = duel_sandbox(2);
+        w.minerals[0] = 9999;
+        let b = w.spawn(Kind::Barracks, Team::Player, v2(1400.0, 900.0));
+        assert!(w.try_train(b, Kind::Pyro));
+        let mut announced = false;
+        for _ in 0..(60 * 9) {
+            w.update(1.0 / 60.0);
+            if w.messages.iter().any(|(m, _)| m == "PYRO READY") {
+                announced = true;
+                break;
+            }
+            assert!(
+                !w.messages.iter().any(|(m, _)| m == "SOLDIER READY"),
+                "a Pyro must not be announced as a soldier"
+            );
+        }
+        assert!(announced, "the finished Pyro should announce itself by name");
+    }
+
+    #[test]
+    fn kills_count_only_the_local_players_finishing_blows() {
+        // The player's soldier lands the kill: exactly one point.
+        let mut w = duel_sandbox(2);
+        let s = w.spawn(Kind::Soldier, Team::Player, v2(1400.0, 900.0));
+        let e = w.spawn(Kind::Soldier, Team::Enemy, v2(1460.0, 900.0));
+        w.ents[e].hp = 10.0;
+        w.ents[s].hp = 10_000.0; // don't let the return fire matter
+        let eid = w.ents[e].id;
+        for _ in 0..(60 * 5) {
+            w.update(1.0 / 60.0);
+            if w.index_of(eid).is_none() {
+                break;
+            }
+        }
+        assert!(w.index_of(eid).is_none(), "the enemy soldier should die");
+        assert_eq!(w.kills, 1, "the player's kill should score exactly once");
+
+        // A rival-vs-rival death is not the player's kill.
+        let mut w2 = duel_sandbox(3);
+        let a = w2.spawn(Kind::Soldier, Team::Enemy, v2(1600.0, 1000.0));
+        let b = w2.spawn(Kind::Soldier, Team::Faction2, v2(1660.0, 1000.0));
+        w2.ents[b].hp = 10.0;
+        w2.ents[a].hp = 10_000.0;
+        let bid = w2.ents[b].id;
+        for _ in 0..(60 * 5) {
+            w2.update(1.0 / 60.0);
+            if w2.index_of(bid).is_none() {
+                break;
+            }
+        }
+        assert!(w2.index_of(bid).is_none(), "the bystander duel should resolve");
+        assert_eq!(w2.kills, 0, "a rival-vs-rival death must not score for the player");
+
+        // Razing a building is not a "kill" either.
+        let mut w3 = duel_sandbox(2);
+        let s = w3.spawn(Kind::Soldier, Team::Player, v2(1400.0, 900.0));
+        let d = w3.spawn(Kind::Depot, Team::Enemy, v2(1460.0, 900.0));
+        w3.ents[d].hp = 5.0;
+        let did = w3.ents[d].id;
+        let _ = s;
+        for _ in 0..(60 * 5) {
+            w3.update(1.0 / 60.0);
+            if w3.index_of(did).is_none() {
+                break;
+            }
+        }
+        assert!(w3.index_of(did).is_none(), "the depot should fall");
+        assert_eq!(w3.kills, 0, "buildings don't count toward the kill tally");
+    }
+
+    #[test]
+    fn snap_to_enemy_finds_any_rival_faction() {
+        let mut w = duel_sandbox(3);
+        let pt = v2(1650.0, 1900.0);
+        // A friendly body closer to the click must be skipped; the Faction2
+        // soldier a bit farther out is the real target.
+        w.spawn(Kind::Soldier, Team::Player, pt.add(v2(10.0, 0.0)));
+        let f2 = w.spawn(Kind::Soldier, Team::Faction2, pt.add(v2(40.0, 0.0)));
+        let f2pos = w.ents[f2].pos;
+        let snapped = w.snap_to_enemy(pt, 130.0).expect("a hostile target in range");
+        assert!(snapped.dist(f2pos) < 1.0, "snap should land on the Faction2 unit");
+    }
+
+    #[test]
+    fn train_commands_respect_the_producer() {
+        let mut w = duel_sandbox(2);
+        w.minerals[0] = 9999;
+        let d = w.spawn(Kind::Depot, Team::Player, v2(1300.0, 900.0));
+        let b = w.spawn(Kind::Barracks, Team::Player, v2(1400.0, 900.0));
+        let f = w.spawn(Kind::Factory, Team::Player, v2(1500.0, 900.0));
+        assert!(!w.try_train(d, Kind::Tank), "a depot trains nothing");
+        assert!(!w.try_train(d, Kind::Worker), "a depot trains nothing");
+        assert!(!w.try_train(b, Kind::Tank), "a barracks can't produce tanks");
+        assert!(!w.try_train(f, Kind::Soldier), "a factory can't produce infantry");
+        assert!(w.try_train(b, Kind::Sapper), "sappers come from the barracks");
+        assert!(w.try_train(f, Kind::Mortar), "mortars come from the factory");
+        assert!(w.ents[d].queue.is_empty(), "nothing may queue at the depot");
+    }
+
+    #[test]
+    fn build_commands_reject_unit_kinds() {
+        let mut w = duel_sandbox(2);
+        w.minerals[0] = 9999;
+        let wi = a_player_worker(&w);
+        let wid = w.ents[wi].id;
+        let m0 = w.minerals[0];
+        w.apply_cmd(Team::Player, &Cmd::Build { worker: wid, kind: Kind::Tank, x: 1400.0, y: 900.0, chain: false });
+        assert!(
+            !matches!(w.ents[wi].order, Order::Build(_, _)),
+            "a forged Build carrying a unit kind must be dropped"
+        );
+        assert_eq!(w.minerals[0], m0, "nothing may be spent on the forged Build");
+    }
+
+    #[test]
+    fn overlapping_cross_team_sites_resolve_at_raise_time() {
+        let mut w = duel_sandbox(2);
+        // Dry up the patches so mining income can't blur the refund arithmetic.
+        for e in w.ents.iter_mut() {
+            if e.kind == Kind::Mineral {
+                e.minerals = 0;
+            }
+        }
+        w.minerals[0] = 9999;
+        w.minerals[1] = 9999;
+        let site = v2(1400.0, 900.0);
+        // The enemy worker starts closer and wins the race to the ground.
+        let wa = w.spawn(Kind::Worker, Team::Player, v2(1100.0, 900.0));
+        let wb = w.spawn(Kind::Worker, Team::Enemy, v2(1550.0, 900.0));
+        assert!(w.order_build(wa, Kind::Depot, site), "player can target the site");
+        assert!(
+            w.order_build(wb, Kind::Depot, site.add(v2(8.0, 0.0))),
+            "a rival's unseen pending site must not block placement"
+        );
+        let (pm, em) = (w.minerals[0], w.minerals[1]);
+        for _ in 0..(60 * 10) {
+            w.update(1.0 / 60.0);
+        }
+        let depots = w
+            .ents
+            .iter()
+            .filter(|e| e.kind == Kind::Depot && e.pos.dist(site) < 60.0)
+            .count();
+        assert_eq!(depots, 1, "only the first arrival may raise a building");
+        // The enemy built (its worker was closer); the player was refunded.
+        assert_eq!(w.minerals[1], em, "the builder keeps its spent cost banked in the shell");
+        assert_eq!(
+            w.minerals[0],
+            pm + cost(Kind::Depot),
+            "the blocked faction gets its minerals back"
+        );
+    }
+
+    #[test]
+    fn a_dying_builders_plan_is_refunded() {
+        let mut w = duel_sandbox(2);
+        w.minerals[0] = 1000;
+        let wi = a_player_worker(&w);
+        w.ents[wi].pos = v2(900.0, 900.0);
+        assert!(w.order_build(wi, Kind::Depot, v2(2200.0, 900.0)));
+        assert!(w.queue_build(wi, Kind::Barracks, v2(2400.0, 900.0)));
+        assert_eq!(w.minerals[0], 1000 - cost(Kind::Depot) - cost(Kind::Barracks));
+        w.ents[wi].hp = -1.0; // sniped en route
+        w.update(1.0 / 60.0);
+        assert_eq!(
+            w.minerals[0],
+            1000,
+            "the whole unbuilt plan must be refunded when the builder dies"
+        );
+    }
+
+    #[test]
+    fn a_walled_off_builder_gives_up_and_refunds() {
+        let mut w = duel_sandbox(2);
+        // Dry up the patches so mining income can't blur the refund arithmetic.
+        for e in w.ents.iter_mut() {
+            if e.kind == Kind::Mineral {
+                e.minerals = 0;
+            }
+        }
+        w.minerals[0] = 1000;
+        let wi = a_player_worker(&w);
+        w.ents[wi].pos = v2(600.0, 510.0);
+        let wid = w.ents[wi].id;
+        // The site sits at the centre of tile (20, 8).
+        let site = v2(20.5 * TCELL, 8.5 * TCELL);
+        assert!(w.order_build(wi, Kind::Depot, site));
+        // NOW wall the site in: a cliff ring around its tile. The interior stays
+        // passable, so pathfinding correctly reports the goal unreachable.
+        let tw = w.tw;
+        for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+            let (tx, ty) = ((20 + dx) as usize, (8 + dy) as usize);
+            w.terrain[ty * tw + tx] = T_CLIFF;
+        }
+        w.has_cliffs = true;
+        for _ in 0..(60 * 8) {
+            w.update(1.0 / 60.0);
+        }
+        let wi = w.index_of(wid).expect("the worker survives its failed errand");
+        assert!(
+            !matches!(w.ents[wi].order, Order::Build(_, _)),
+            "the stuck builder should abandon the unreachable site"
+        );
+        assert_eq!(w.minerals[0], 1000, "the locked minerals must come back");
+    }
+
+    #[test]
+    fn surrender_eliminates_the_acting_faction() {
+        let mut w = duel_sandbox(2);
+        w.apply_cmd(Team::Enemy, &Cmd::Surrender);
+        w.update(1.0 / 60.0);
+        assert!(!w.faction_alive(Team::Enemy), "the surrendering faction is out");
+        assert!(w.faction_alive(Team::Player), "the opponent is untouched");
+        assert!(w.match_over, "one faction left ends the match for everyone");
+        assert_eq!(w.over, 1, "the survivor takes the win");
+    }
+
+    #[test]
+    fn seen_buildings_remember_and_forget_enemy_structures() {
+        let mut w = duel_sandbox(2);
+        let bp = w.ents[w.first_base(Team::Player).unwrap()].pos;
+        // An enemy barracks well inside the player base's sight.
+        let eb = w.spawn(Kind::Barracks, Team::Enemy, bp.add(v2(200.0, 0.0)));
+        let epos = w.ents[eb].pos;
+        w.update(1.0 / 60.0);
+        assert!(
+            w.seen_buildings
+                .iter()
+                .any(|&(p, k, t)| k == Kind::Barracks && t == Team::Enemy && p.dist(epos) < 4.0),
+            "a visible enemy building should be memorised"
+        );
+        // It falls while still in view: the memory is pruned, not haunted.
+        let ebid = w.ents[eb].id;
+        let ei = w.index_of(ebid).unwrap();
+        w.ents[ei].hp = -1.0;
+        w.update(1.0 / 60.0);
+        w.update(1.0 / 60.0);
+        assert!(
+            !w.seen_buildings.iter().any(|&(p, _, _)| p.dist(epos) < 4.0),
+            "a razed building in full view must be forgotten"
         );
     }
 

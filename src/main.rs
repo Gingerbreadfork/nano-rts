@@ -1126,7 +1126,14 @@ fn main() {
                     match k {
                         Key::Escape => ui.menu = false,             // resume
                         Key::G => {
-                            world.over = -1; // surrender -> defeat
+                            // Surrender: defeat locally right away for a snappy
+                            // overlay; in a versus game the elimination itself
+                            // travels as a lockstep command so every peer sees
+                            // the faction fall inside the shared sim.
+                            world.over = -1;
+                            if net.is_some() {
+                                frame_cmds.push(world::Cmd::Surrender);
+                            }
                             ui.menu = false;
                         }
                         Key::M => done = Some(GameOutcome::ToMenu),
@@ -1214,7 +1221,7 @@ fn main() {
                     Key::A => {
                         let has_mil = world.ents.iter().any(|e| {
                             e.selected
-                                && e.team == Team::Player
+                                && e.team == world.my_team
                                 && (world::is_army(e.kind) || e.kind == Kind::Worker)
                         });
                         if has_mil {
@@ -1260,7 +1267,13 @@ fn main() {
                         match act {
                             MenuAct::Resume => ui.menu = false,
                             MenuAct::Surrender => {
+                                // Same as the G hotkey: instant local defeat,
+                                // plus the lockstep command in versus so the
+                                // shared sim eliminates the faction everywhere.
                                 world.over = -1;
+                                if net.is_some() {
+                                    frame_cmds.push(world::Cmd::Surrender);
+                                }
                                 ui.menu = false;
                             }
                             MenuAct::Restart if net.is_none() => {
@@ -1296,7 +1309,12 @@ fn main() {
                     world.clamp_cam(canvas.w as f32, canvas.h as f32);
                 }
             } else {
-                if !in_overlay && left_pressed && !in_hud(mouse) && !in_minimap(mouse, canvas.w, canvas.h) {
+                if !in_overlay
+                    && left_pressed
+                    && !in_hud(mouse)
+                    && !in_bottom_bar(mouse, canvas.h)
+                    && !in_minimap(mouse, canvas.w, canvas.h)
+                {
                     if ui.attack_pending {
                         frame_cmds.push(world::Cmd::Order {
                             ids: world.selected_ids(),
@@ -1367,7 +1385,7 @@ fn main() {
                     let tgt = if in_minimap(mouse, canvas.w, canvas.h) {
                         let wp = mm_to_world(mouse, canvas.w, canvas.h, world.world_w, world.world_h);
                         Some(world.snap_to_enemy(wp, 130.0).unwrap_or(wp))
-                    } else if !in_hud(mouse) {
+                    } else if !in_hud(mouse) && !in_bottom_bar(mouse, canvas.h) {
                         Some(wm)
                     } else {
                         None
@@ -1835,6 +1853,11 @@ fn sound_at_view(vmin: V2, vmax: V2, p: V2) -> (f32, f32) {
 fn in_hud(m: V2) -> bool {
     m.y < HUD_H as f32
 }
+/// The 22px action-hint bar pinned to the bottom edge (see `draw_hud`). Clicks
+/// on it are UI, not world commands, so it shields the map like the top HUD.
+fn in_bottom_bar(m: V2, sh: i32) -> bool {
+    m.y >= (sh - 22) as f32
+}
 fn in_minimap(m: V2, sw: i32, sh: i32) -> bool {
     let (mx, my) = (mm_x(sw), mm_y(sh));
     m.x >= mx as f32
@@ -1980,9 +2003,9 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
         c.fill_diamond(sx - 2, sy - 2, (inner / 3).max(1), rgb(190, 250, 255));
     }
 
-    // Pending build ghosts (player workers walking out to construct).
+    // Pending build ghosts (the local player's workers walking out to construct).
     for e in &w.ents {
-        if e.team != Team::Player {
+        if e.team != w.my_team {
             continue;
         }
         if let Order::Build(k, site) = e.order {
@@ -2001,7 +2024,26 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
         if e.team != w.my_team && w.vis_at(e.pos) != 2 {
             continue;
         }
-        draw_building(c, e, w2s(e.pos));
+        draw_building(c, e, w2s(e.pos), e.team == w.my_team);
+    }
+
+    // Remembered enemy structures: buildings scouted earlier whose ground has
+    // slipped back under the fog. A dim hollow footprint in the owner's colour
+    // — clearly stale intel, not a live sighting — drawn before the fog pass so
+    // the explored-dim shades it naturally. Once the spot is visible again the
+    // live building (or bare ground) takes over.
+    for &(p, k, t) in &w.seen_buildings {
+        if w.vis_at(p) != 1 {
+            continue;
+        }
+        let (sx, sy) = w2s(p);
+        let r = radius(k) as i32;
+        if sx < -(r + 4) || sy < -(r + 4) || sx > c.w + r + 4 || sy > c.h + r + 4 {
+            continue;
+        }
+        let ghost = gfx::mix(rgb(22, 25, 20), edge_of(t), 0.5);
+        c.fill_rect_a(sx - r, sy - r, r * 2, r * 2, ghost, 0.16);
+        c.rect(sx - r, sy - r, r * 2, r * 2, ghost);
     }
 
     // Rally lines for selected production buildings (depots train nothing, so
@@ -2159,22 +2201,34 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
             }
         }
         if e.hp < e.max_hp {
-            draw_hpbar(c, sx, sy - r - 6, (r * 2 + 4).max(12), e.hp / e.max_hp, e.team);
+            draw_hpbar(c, sx, sy - r - 6, (r * 2 + 4).max(12), e.hp / e.max_hp, e.team == w.my_team);
         }
     }
 
-    // Tracers (weapon fire).
+    // Tracers (weapon fire). Same cheap offscreen cull as entities: weapon
+    // segments are short, so both endpoints well outside the view means the
+    // whole line is.
     for t in &w.tracers {
         let (ax, ay) = w2s(t.a);
         let (bx2, by2) = w2s(t.b);
+        let m = 24;
+        let off = |x: i32, y: i32| x < -m || y < -m || x > c.w + m || y > c.h + m;
+        if off(ax, ay) && off(bx2, by2) {
+            continue;
+        }
         let a = (t.life / 0.08).clamp(0.0, 1.0);
         let col = gfx::mix(rgb(22, 25, 20), t.color, a);
         c.line(ax, ay, bx2, by2, col);
     }
 
-    // Shockwave rings (drawn under particles), expanding and fading.
+    // Shockwave rings (drawn under particles), expanding and fading. Culled by
+    // the ring's full grown radius so one never pops in mid-expansion.
     for s in &w.shocks {
         let (px, py) = w2s(s.pos);
+        let m = s.max_r as i32 + 8;
+        if px < -m || py < -m || px > c.w + m || py > c.h + m {
+            continue;
+        }
         let prog = 1.0 - (s.life / s.max_life).clamp(0.0, 1.0); // 0 -> 1
         let rr = (s.max_r * (1.0 - (1.0 - prog).powi(2))) as i32; // ease-out
         let intensity = (s.life / s.max_life).clamp(0.0, 1.0) * 0.9;
@@ -2242,14 +2296,18 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
     }
 
     // ---- Fog of war: black out the unseen, dim what's only remembered. ----
+    // `vis` holds one grid per faction back to back; read from the LOCAL
+    // viewer's slice (as the minimap does), so a joining peer sees their own
+    // fog rather than the host's.
     let cs = w.fog_cell as i32;
+    let fog_base = w.my_team.idx() * (w.fog_w * w.fog_h);
     let gx0 = (camx / cs).max(0);
     let gy0 = (camy / cs).max(0);
     let gx1 = (((camx + c.w) / cs) + 1).min(w.fog_w as i32 - 1);
     let gy1 = (((camy + c.h) / cs) + 1).min(w.fog_h as i32 - 1);
     let unseen = rgb(6, 7, 10);
     for gy in gy0..=gy1 {
-        let row = gy as usize * w.fog_w;
+        let row = fog_base + gy as usize * w.fog_w;
         for gx in gx0..=gx1 {
             let v = w.vis[row + gx as usize];
             if v == 2 {
@@ -2317,6 +2375,13 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
         if !ok {
             for e in &w.ents {
                 if !world::is_building(e.kind) {
+                    continue;
+                }
+                // Only ring blockers the player can know about — their own
+                // buildings or ones currently in sight. An enemy structure
+                // hidden under the fog still blocks, but ringing it would leak
+                // its position.
+                if e.team != w.my_team && w.vis_at(e.pos) != 2 {
                     continue;
                 }
                 let need = radius(k) + radius(e.kind) + world::BUILD_GAP;
@@ -2444,7 +2509,7 @@ fn draw_grid(c: &mut Canvas, camx: i32, camy: i32) {
     }
 }
 
-fn draw_building(c: &mut Canvas, e: &world::Ent, (sx, sy): (i32, i32)) {
+fn draw_building(c: &mut Canvas, e: &world::Ent, (sx, sy): (i32, i32), mine: bool) {
     let r = radius(e.kind) as i32;
     let mut fill = fill_of(e.team);
     if e.flash > 0.0 {
@@ -2551,7 +2616,7 @@ fn draw_building(c: &mut Canvas, e: &world::Ent, (sx, sy): (i32, i32)) {
     }
 
     // HP bar.
-    draw_hpbar(c, sx, sy - r - 8, r * 2, e.hp / e.max_hp, e.team);
+    draw_hpbar(c, sx, sy - r - 8, r * 2, e.hp / e.max_hp, mine);
 
     // Production progress + queue size.
     if !e.queue.is_empty() {
@@ -2566,11 +2631,13 @@ fn draw_building(c: &mut Canvas, e: &world::Ent, (sx, sy): (i32, i32)) {
     }
 }
 
-fn draw_hpbar(c: &mut Canvas, cx: i32, top: i32, width: i32, frac: f32, team: Team) {
+/// `mine` is whether the entity belongs to the LOCAL player (any faction):
+/// friendly bars traffic-light with health, everyone else's stay enemy-red.
+fn draw_hpbar(c: &mut Canvas, cx: i32, top: i32, width: i32, frac: f32, mine: bool) {
     let frac = frac.clamp(0.0, 1.0);
     let x = cx - width / 2;
     c.fill_rect(x - 1, top - 1, width + 2, 5, rgb(8, 10, 12));
-    let fg = if team == Team::Player {
+    let fg = if mine {
         if frac > 0.5 {
             rgb(90, 220, 110)
         } else if frac > 0.25 {
@@ -2633,6 +2700,20 @@ fn draw_minimap(c: &mut Canvas, w: &World) {
             _ => (fill_of(e.team), 1),
         };
         c.fill_rect(bx - sz / 2, by - sz / 2, sz.max(1) + 1, sz.max(1) + 1, col);
+    }
+
+    // Remembered enemy buildings: dim team-coloured dots where each was last
+    // scouted, matching the main view's fog ghosts. Drawn before the fog
+    // overlay so explored-dim shades them like everything else remembered.
+    for &(p, k, t) in &w.seen_buildings {
+        if w.vis_at(p) != 1 {
+            continue;
+        }
+        let bx = mmx + (p.x * sx) as i32;
+        let by = mmy + (p.y * sy) as i32;
+        let sz = if k == Kind::Base { 3 } else { 2 };
+        let col = gfx::mix(rgb(16, 18, 14), edge_of(t), 0.6);
+        c.fill_rect(bx - sz / 2, by - sz / 2, sz + 1, sz + 1, col);
     }
 
     // Fog of war on the minimap: black out what you've never seen, and dim the
@@ -2840,5 +2921,66 @@ fn draw_gameover(c: &mut Canvas, w: &World, mouse: V2) {
     for (b, _) in gameover_buttons(c, w.versus) {
         let hover = b.hit(mouse);
         b.draw(c, hover);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_bar_shields_world_clicks() {
+        let h = DESIGN_H;
+        // The bar covers the bottom 22px exactly; just above it is world.
+        assert!(in_bottom_bar(v2(10.0, (h - 1) as f32), h));
+        assert!(in_bottom_bar(v2(10.0, (h - 22) as f32), h));
+        assert!(!in_bottom_bar(v2(10.0, (h - 23) as f32), h));
+    }
+
+    #[test]
+    fn hpbar_colors_track_ownership_not_faction() {
+        // Full-health bars: the local player's reads green, anyone else's red —
+        // regardless of which faction slot the local player occupies.
+        let mut c = Canvas::new(64, 16);
+        draw_hpbar(&mut c, 32, 8, 40, 1.0, true);
+        assert_eq!(c.buf[8 * 64 + 32], rgb(90, 220, 110));
+        draw_hpbar(&mut c, 32, 8, 40, 1.0, false);
+        assert_eq!(c.buf[8 * 64 + 32], rgb(228, 90, 80));
+    }
+
+    /// A joining peer (my_team != Team::Player) must render fog from THEIR
+    /// slice of the per-faction visibility grid. Under the old indexing the
+    /// main view read faction 0's slice, so the joiner's own base sat under
+    /// the host's unexplored black.
+    #[test]
+    fn fog_overlay_reads_local_viewers_grid() {
+        let is_ai = [false; world::MAX_FACTIONS];
+        let mut w = World::new_match(7, 2, is_ai, Team::Enemy, true);
+        w.update(1.0 / 60.0); // one tick fills every faction's fog grid
+        let bp = w
+            .ents
+            .iter()
+            .find(|e| e.kind == Kind::Base && e.team == Team::Enemy)
+            .expect("joiner has a base")
+            .pos;
+        // Preconditions that make the test meaningful: the spot is visible to
+        // the viewer but unexplored by faction 0 (whose grid the bug read).
+        assert_eq!(w.team_vis_at(Team::Enemy, bp), 2);
+        assert_eq!(w.team_vis_at(Team::Player, bp), 0);
+        // Centre the view on the base (unclamped, so it lands mid-canvas away
+        // from the HUD, minimap, and bottom bar) and render a frame.
+        let mut c = Canvas::new(640, 480);
+        w.cam = v2(bp.x - 320.0, bp.y - 240.0);
+        let ui = Ui {
+            drag_start: None,
+            dragging: false,
+            build_mode: None,
+            attack_pending: false,
+            show_help: false,
+            menu: false,
+        };
+        render(&mut c, &w, &ui, v2(0.0, 0.0));
+        // The base pixel must not be the exact "never seen" fog fill.
+        assert_ne!(c.buf[240 * 640 + 320], rgb(6, 7, 10));
     }
 }
