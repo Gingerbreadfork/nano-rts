@@ -9,10 +9,11 @@
 use crate::vec::{v2, V2};
 use crate::world::{cost, is_army, is_building, supply_cost, tie_key, Intent, Kind, Order, Strategy, Team, World};
 
-/// Is `e` an enemy of faction `me` (a different, non-neutral faction)?
+/// Is `team` an enemy of faction `me`? Alliance-aware: a teammate in a 2v2 is
+/// not a foe, so the brain never targets, scouts, or fears an ally.
 #[inline]
-fn is_foe(team: Team, me: Team) -> bool {
-    team != me && team != Team::Neutral
+fn is_foe(w: &World, team: Team, me: Team) -> bool {
+    w.hostile(me, team)
 }
 
 fn map_center(w: &World) -> V2 {
@@ -24,7 +25,7 @@ fn nearest_enemy_base(w: &World, me: Team, from: V2) -> Option<V2> {
     let mut bd = f32::MAX;
     let mut bk = 0u64;
     for e in &w.ents {
-        if e.kind == Kind::Base && is_foe(e.team, me) {
+        if e.kind == Kind::Base && is_foe(w, e.team, me) {
             let d = e.pos.dist_sq(from);
             // Equidistant rival bases: pick by a hashed id, not list order, so
             // no faction (least of all the human) is everyone's default target.
@@ -82,6 +83,7 @@ pub fn ai_update(w: &mut World, dt: f32, me: Team) {
     let mut barracks: Vec<usize> = Vec::new();
     let mut factories: Vec<usize> = Vec::new();
     let mut bases: Vec<usize> = Vec::new();
+    let mut turrets = 0u32; // standing or rising — either counts as covered
     let mut army: Vec<usize> = Vec::new(); // soldiers + tanks, minus the scout
     let mut army_supply = 0u32;
 
@@ -105,6 +107,7 @@ pub fn ai_update(w: &mut World, dt: f32, me: Team) {
             Kind::Barracks if e.build_left <= 0.0 => barracks.push(i),
             Kind::Factory if e.build_left <= 0.0 => factories.push(i),
             Kind::Base => bases.push(i),
+            Kind::Turret => turrets += 1,
             _ => {}
         }
     }
@@ -224,6 +227,41 @@ pub fn ai_update(w: &mut World, dt: f32, me: Team) {
         }
     }
 
+    // ---------------- static defense ----------------
+    // Salt each mining base with a turret once barracks tech is in: cheap
+    // insurance against raiders and worker rushes. Rushers skip it (every
+    // mineral goes into the all-in); macro players add a spare.
+    let turret_want = match strat {
+        Strategy::Rush => 0,
+        Strategy::Macro => bases.len() as u32 + 1,
+        _ => bases.len() as u32,
+    };
+    if turrets < turret_want
+        && !barracks.is_empty()
+        && minerals >= cost(Kind::Turret) + 60
+        && !pending(w, Kind::Turret, me)
+    {
+        // The first base with no turret standing guard nearby gets one, placed
+        // toward the map centre — between the mineral line and the likely
+        // approach. free_site rings outward if the exact spot is taken.
+        let guard2 = 260.0f32 * 260.0;
+        let naked = bases.iter().copied().find(|&bi| {
+            let bp = w.ents[bi].pos;
+            !w.ents
+                .iter()
+                .any(|t| t.team == me && t.kind == Kind::Turret && t.pos.dist_sq(bp) < guard2)
+        });
+        if let Some(bi) = naked {
+            let bp = w.ents[bi].pos;
+            let fwd = map_center(w).sub(bp).norm();
+            if let (Some(wi), Some(s)) =
+                (pick_worker(w, me), free_site(w, bp.add(fwd.scale(140.0)), Kind::Turret, me))
+            {
+                w.order_build(wi, Kind::Turret, s);
+            }
+        }
+    }
+
     // ---------------- expansion (threshold varies) ----------------
     // No one-shot latch here: the base census counts a rising expansion and
     // `pending` covers the builder walking out, so if the builder is sniped or
@@ -302,7 +340,7 @@ fn update_intel(w: &mut World, me: Team) {
     let mut sup = 0u32;
     let mut new_buildings: Vec<(V2, Kind)> = Vec::new();
     for e in &w.ents {
-        if !is_foe(e.team, me) || w.team_vis_at(me, e.pos) != 2 {
+        if !is_foe(w, e.team, me) || w.team_vis_at(me, e.pos) != 2 {
             continue;
         }
         match e.kind {
@@ -337,7 +375,7 @@ fn update_intel(w: &mut World, me: Team) {
         let visible = w.team_vis_at(me, p) == 2;
         let standing = visible
             && w.ents.iter().any(|e| {
-                is_foe(e.team, me) && is_building(e.kind) && e.pos.dist_sq(p) < 60.0 * 60.0
+                is_foe(w, e.team, me) && is_building(e.kind) && e.pos.dist_sq(p) < 60.0 * 60.0
             });
         if visible && !standing {
             w.ai[mi].known.remove(k);
@@ -431,13 +469,22 @@ fn run_doctrine(w: &mut World, army: &[usize], army_supply: u32, bases: &[usize]
     // 1) DEFEND — react to *visible* enemies near a base, scaled to how big the
     // raid actually is. Workers count as attackers: they only hit for 3, but a
     // worker rush in numbers is a real threat.
+    // Everything this faction answers for: its own bases plus any ally's — a
+    // good teammate marches when the partner's line is hit (shared vision
+    // means the raid is visible from the ally's own buildings).
+    let mut guard: Vec<V2> = bases.iter().map(|&bi| w.ents[bi].pos).collect();
+    for e in &w.ents {
+        if e.kind == Kind::Base && e.team != me && e.team != Team::Neutral && w.allied(me, e.team) {
+            guard.push(e.pos);
+        }
+    }
     let mut threat: Option<V2> = None; // the attacker nearest to any base
     let mut home = base_fallback(w, bases, staging); // the base under threat
     let mut threat_supply = 0u32;
     let mut attackers: Vec<usize> = Vec::new();
     let mut bd = 360.0f32 * 360.0;
     for (i, e) in w.ents.iter().enumerate() {
-        if !is_foe(e.team, me)
+        if !is_foe(w, e.team, me)
             || !(is_army(e.kind) || e.kind == Kind::Worker)
             || w.team_vis_at(me, e.pos) != 2
         {
@@ -445,11 +492,11 @@ fn run_doctrine(w: &mut World, army: &[usize], army_supply: u32, bases: &[usize]
         }
         let mut nd = f32::MAX;
         let mut nb = home;
-        for &bi in bases {
-            let d = e.pos.dist_sq(w.ents[bi].pos);
+        for &gp in &guard {
+            let d = e.pos.dist_sq(gp);
             if d < nd {
                 nd = d;
-                nb = w.ents[bi].pos;
+                nb = gp;
             }
         }
         if nd >= 360.0 * 360.0 {
@@ -881,6 +928,47 @@ mod tests {
             matches!(w.ai[mi].intent, Intent::Commit(_) | Intent::Feint(_)),
             "an army last seen minutes ago should no longer scare the AI into turtling"
         );
+    }
+
+    #[test]
+    fn a_macro_ai_salts_its_base_with_a_turret() {
+        let mut w = World::new(3);
+        w.flatten_terrain();
+        let mi = Team::Enemy.idx();
+        w.ai[mi].strategy = Strategy::Macro;
+        w.minerals[mi] = 1000;
+        let bp = enemy_base_pos(&w);
+        w.spawn(Kind::Barracks, Team::Enemy, bp.add(v2(0.0, 220.0)));
+        think(&mut w, 10);
+        assert!(
+            w.ents.iter().any(|e| e.team == Team::Enemy
+                && (e.kind == Kind::Turret
+                    || matches!(e.order, Order::Build(Kind::Turret, _))
+                    || e.build_queue.iter().any(|&(k, _)| k == Kind::Turret))),
+            "a macro AI with a bank and a barracks should be raising a turret"
+        );
+    }
+
+    #[test]
+    fn an_allied_ai_never_targets_its_partner() {
+        // 2v2: Enemy (faction 1) allied with Faction3, at war with 0 and 2.
+        let mut w = World::new_match_teams(9, 4, [false, true, true, true], Team::Player, false, [0, 1, 0, 1]);
+        w.flatten_terrain();
+        let mi = Team::Enemy.idx();
+        // Its opening objective must be a hostile base, not the partner's.
+        let obj = w.ai[mi].player_main;
+        let nearest_hostile = w
+            .ents
+            .iter()
+            .filter(|e| e.kind == Kind::Base && matches!(e.team, Team::Player | Team::Faction2))
+            .any(|e| e.pos.dist(obj) < 1.0);
+        assert!(nearest_hostile, "the AI's objective should be an enemy base");
+        // And a partner unit parked in view is not intel worth reacting to.
+        let bp = enemy_base_pos(&w);
+        w.spawn(Kind::Soldier, Team::Faction3, bp.add(v2(120.0, 0.0)));
+        w.update(1.0 / 60.0); // fog pass so the visitor is in full view
+        think(&mut w, 3);
+        assert_eq!(w.ai[mi].seen_army_supply, 0, "an allied army is not an enemy sighting");
     }
 
     #[test]

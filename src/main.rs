@@ -293,7 +293,9 @@ const MP_PORT: u16 = 7777;
 /// The app's top-level state, threaded through the main loop.
 enum AppNext {
     Menu,
-    Single(usize), // free-for-all with this many factions (1 human + AI)
+    /// A skirmish: this many factions (1 human + AI) with these alliance ids
+    /// ([0,1,2,3] = free-for-all, [0,1,0,1] = 2v2 with the green AI).
+    Single(usize, [u8; world::MAX_FACTIONS]),
     Host(u16),
     Join(String),
     Quit,
@@ -483,11 +485,12 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
         let click = left && !last_left;
         last_left = left;
 
-        draw_menu_bg(canvas, t, "SKIRMISH", "HOW MANY RIVALS? (FREE-FOR-ALL)", accent);
+        draw_menu_bg(canvas, t, "SKIRMISH", "PICK YOUR BATTLE", accent);
         let cx = canvas.w / 2;
-        let labels = ["1 AI  (DUEL)", "2 AI  (3-WAY)", "3 AI  (4-WAY)"];
-        let (bw, bh, gap) = (380, 56, 18);
-        let y0 = canvas.h / 2 - 80;
+        let labels = ["1 AI  (DUEL)", "2 AI  (3-WAY FFA)", "3 AI  (4-WAY FFA)", "2V2  (AI ALLY VS 2 AI)"];
+        // 420 wide so the longest label ("2V2 ...", 396px at scale 3) stays inside the button.
+        let (bw, bh, gap) = (420, 56, 18);
+        let y0 = canvas.h / 2 - 110;
         let mut chosen: Option<usize> = None;
         for (i, lab) in labels.iter().enumerate() {
             let b = Btn::new(cx, y0 + i as i32 * (bh + gap), bw, bh, lab, accent);
@@ -497,7 +500,7 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
                 chosen = Some(i);
             }
         }
-        let back = Btn::new(cx, y0 + 3 * (bh + gap) + 8, 220, 46, "BACK  [ESC]", rgb(180, 190, 196));
+        let back = Btn::new(cx, y0 + 4 * (bh + gap) + 8, 220, 46, "BACK  [ESC]", rgb(180, 190, 196));
         let bhover = back.hit(mouse);
         back.draw(canvas, bhover);
         if click && bhover {
@@ -508,6 +511,7 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
                 Key::Key1 | Key::NumPad1 => chosen = Some(0),
                 Key::Key2 | Key::NumPad2 => chosen = Some(1),
                 Key::Key3 | Key::NumPad3 => chosen = Some(2),
+                Key::Key4 | Key::NumPad4 => chosen = Some(3),
                 Key::Escape => return AppNext::Menu,
                 _ => {}
             }
@@ -516,8 +520,12 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
         if !windowed {
             fullscreen_tick(t);
         }
-        if let Some(i) = chosen {
-            return AppNext::Single(i + 2); // factions = opponents + 1 human
+        match chosen {
+            // Free-for-all: factions = opponents + 1 human, everyone for themselves.
+            Some(i @ 0..=2) => return AppNext::Single(i + 2, [0, 1, 2, 3]),
+            // 2v2: you + the green AI against the red + amber AIs.
+            Some(3) => return AppNext::Single(4, [0, 1, 0, 1]),
+            _ => {}
         }
         t += 1;
     }
@@ -654,27 +662,40 @@ fn run_host_lobby(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas,
         last_left = left;
 
         let players = host.players();
+        let twovtwo = host.teams == [0, 0, 1, 1];
         draw_menu_bg(canvas, t, "HOSTING", &ip, accent);
         let cx = canvas.w / 2;
         // Slot list: 0 = you, 1..3 = joined / waiting / (AI on start).
         let mut y = canvas.h / 2 - 150;
         for f in 0..4 {
+            // In 2v2, tag each slot with its side so everyone knows the split.
+            let side = if twovtwo { if host.teams[f] == 0 { "  [TEAM 1]" } else { "  [TEAM 2]" } } else { "" };
             let (label, col) = if f == 0 {
-                (format!("SLOT {}:  YOU  ({})", f + 1, faction_name(Team::from_idx(f))), rgb(120, 230, 150))
+                (format!("SLOT {}:  YOU  ({}){}", f + 1, faction_name(Team::from_idx(f)), side), rgb(120, 230, 150))
             } else if f < players {
-                (format!("SLOT {}:  PLAYER  ({})", f + 1, faction_name(Team::from_idx(f))), rgb(150, 200, 255))
+                (format!("SLOT {}:  PLAYER  ({}){}", f + 1, faction_name(Team::from_idx(f)), side), rgb(150, 200, 255))
             } else {
-                (format!("SLOT {}:  OPEN -> AI", f + 1), rgb(120, 130, 140))
+                (format!("SLOT {}:  OPEN -> AI{}", f + 1, side), rgb(120, 130, 140))
             };
             canvas.text_center(cx, y, &label, col, 3);
             y += 40;
         }
         canvas.text_center(cx, y + 8, &format!("{} PLAYER{} CONNECTED  -  LAN DISCOVERY ON", players, if players == 1 { "" } else { "S" }), rgb(150, 165, 170), 2);
 
-        let start = Btn::new(cx, canvas.h - 150, 340, 56, "START MATCH", rgb(120, 230, 150));
+        // Mode toggle: free-for-all or a 2v2 (slots 1+2 versus 3+4).
+        let mode_label = if twovtwo { "MODE: 2V2  (1+2 VS 3+4)" } else { "MODE: FREE-FOR-ALL" };
+        // 440 wide so the 2V2 label (414px at scale 3) fits; START MATCH matches for alignment.
+        let mode = Btn::new(cx, canvas.h - 222, 440, 48, mode_label, rgb(255, 200, 90));
+        let mhover = mode.hit(mouse);
+        mode.draw(canvas, mhover);
+        if (click && mhover) || window.is_key_pressed(Key::T, KeyRepeat::No) {
+            host.teams = if twovtwo { [0, 1, 2, 3] } else { [0, 0, 1, 1] };
+        }
+
+        let start = Btn::new(cx, canvas.h - 150, 440, 56, "START MATCH", rgb(120, 230, 150));
         let shover = start.hit(mouse);
         start.draw(canvas, shover);
-        canvas.text_center(cx, canvas.h - 78, "EMPTY SLOTS BECOME AI  -  ESC TO CANCEL", rgb(150, 165, 170), 2);
+        canvas.text_center(cx, canvas.h - 78, "EMPTY SLOTS BECOME AI  -  T TOGGLES MODE  -  ESC TO CANCEL", rgb(150, 165, 170), 2);
         let begin = (click && shover) || window.is_key_pressed(Key::Enter, KeyRepeat::No);
 
         present_frame(window, screen, canvas, x_map);
@@ -780,22 +801,37 @@ fn intro_world(w: &mut World, canvas: &Canvas) {
         w.clamp_cam(canvas.w as f32, canvas.h as f32);
     }
     w.messages.clear();
-    let foes = w.factions - 1;
-    w.msg(&format!(
-        "YOU ARE {} - {} RIVAL{} - LAST ONE STANDING WINS",
-        faction_name(w.my_team),
-        foes,
-        if foes == 1 { "" } else { "S" },
-    ));
+    let allies: Vec<&str> = (0..w.factions)
+        .map(Team::from_idx)
+        .filter(|&t| t != w.my_team && w.allied(w.my_team, t))
+        .map(faction_name)
+        .collect();
+    let foes = (0..w.factions)
+        .filter(|&f| w.hostile(w.my_team, Team::from_idx(f)))
+        .count();
+    if allies.is_empty() {
+        w.msg(&format!(
+            "YOU ARE {} - {} RIVAL{} - LAST ONE STANDING WINS",
+            faction_name(w.my_team),
+            foes,
+            if foes == 1 { "" } else { "S" },
+        ));
+    } else {
+        w.msg(&format!(
+            "YOU ARE {} - ALLIED WITH {} - LAST TEAM STANDING WINS",
+            faction_name(w.my_team),
+            allies.join(" + "),
+        ));
+    }
 }
 
-/// A fresh single-player free-for-all: faction 0 is the human, the rest are AI.
-fn make_world_sp(factions: usize, canvas: &Canvas) -> World {
+/// A fresh single-player skirmish: faction 0 is the human, the rest are AI.
+fn make_world_sp(factions: usize, teams: [u8; world::MAX_FACTIONS], canvas: &Canvas) -> World {
     let mut is_ai = [false; world::MAX_FACTIONS];
     for slot in is_ai.iter_mut().take(factions).skip(1) {
         *slot = true;
     }
-    let mut w = World::new_match(seed(), factions, is_ai, Team::Player, false);
+    let mut w = World::new_match_teams(seed(), factions, is_ai, Team::Player, false, teams);
     intro_world(&mut w, canvas);
     w
 }
@@ -806,7 +842,7 @@ fn make_world_mp(ls: &net::Lockstep, canvas: &Canvas) -> World {
     for fi in 0..ls.factions {
         is_ai[fi] = ls.is_ai[fi];
     }
-    let mut w = World::new_match(ls.seed, ls.factions, is_ai, Team::from_idx(ls.my_faction), true);
+    let mut w = World::new_match_teams(ls.seed, ls.factions, is_ai, Team::from_idx(ls.my_faction), true, ls.alliance);
     intro_world(&mut w, canvas);
     w
 }
@@ -1010,7 +1046,7 @@ fn main() {
                 next = run_main_menu(&mut window, &mut screen, &mut canvas, &mut x_map, windowed);
                 continue 'app;
             }
-            AppNext::Single(factions) => (None, make_world_sp(factions, &canvas)),
+            AppNext::Single(factions, teams) => (None, make_world_sp(factions, teams, &canvas)),
             AppNext::Host(port) => match run_host_lobby(&mut window, &mut screen, &mut canvas, &mut x_map, windowed, port) {
                 Some(ls) => {
                     let w = make_world_mp(&ls, &canvas);
@@ -1147,10 +1183,10 @@ fn main() {
                     match k {
                         // Restart only makes sense single-player; in versus both
                         // sims must stay identical, so there's no local reset.
-                        // Reuse the current match's player count so "play again"
-                        // keeps the 3-/4-way setup you chose.
+                        // Reuse the current match's player count and team setup
+                        // so "play again" keeps the mode you chose.
                         Key::R if net.is_none() => {
-                            world = make_world_sp(world.factions, &canvas);
+                            world = make_world_sp(world.factions, world.alliance, &canvas);
                             ui.build_mode = None;
                             ui.attack_pending = false;
                             ui.dragging = false;
@@ -1199,7 +1235,22 @@ fn main() {
                     Key::E => queue_train(&world, &mut frame_cmds, Kind::Barracks, Kind::Soldier),
                     Key::Y => queue_train(&world, &mut frame_cmds, Kind::Barracks, Kind::Pyro),
                     Key::G => queue_train(&world, &mut frame_cmds, Kind::Barracks, Kind::Sapper),
-                    Key::T => queue_train(&world, &mut frame_cmds, Kind::Factory, Kind::Tank),
+                    // T is contextual: a selected Factory trains a Tank; otherwise a
+                    // selected worker places a Turret. A selection never holds both.
+                    Key::T if world.least_loaded_selected(Kind::Factory).is_some() => {
+                        queue_train(&world, &mut frame_cmds, Kind::Factory, Kind::Tank)
+                    }
+                    Key::T => {
+                        if has_player_worker(&world) {
+                            if world.tech_ok(world.my_team, Kind::Turret) {
+                                ui.build_mode = Some(Kind::Turret);
+                                ui.attack_pending = false;
+                                world.msg("LEFT-CLICK TO PLACE TURRET (SHIFT-CLICK CHAINS)");
+                            } else {
+                                world.msg("TURRET NEEDS A BARRACKS");
+                            }
+                        }
+                    }
                     Key::R => queue_train(&world, &mut frame_cmds, Kind::Factory, Kind::Raider),
                     Key::V => queue_train(&world, &mut frame_cmds, Kind::Factory, Kind::Mortar),
                     // Enter build-placement mode (needs a worker selected).
@@ -1277,7 +1328,7 @@ fn main() {
                                 ui.menu = false;
                             }
                             MenuAct::Restart if net.is_none() => {
-                                world = make_world_sp(world.factions, &canvas);
+                                world = make_world_sp(world.factions, world.alliance, &canvas);
                                 ui.build_mode = None;
                                 ui.attack_pending = false;
                                 ui.dragging = false;
@@ -1801,7 +1852,7 @@ fn run_peer(mut ls: net::Lockstep) -> (usize, Option<u32>, u32, u32, u64) {
     for fi in 0..ls.factions {
         is_ai[fi] = ls.is_ai[fi];
     }
-    let mut w = World::new_match(ls.seed, ls.factions, is_ai, Team::from_idx(ls.my_faction), true);
+    let mut w = World::new_match_teams(ls.seed, ls.factions, is_ai, Team::from_idx(ls.my_faction), true, ls.alliance);
     let me = Team::from_idx(ls.my_faction);
     let max = 900u32;
     let mut injected = false;
@@ -1962,6 +2013,7 @@ fn kind_name(k: Kind) -> &'static str {
         Kind::Raider => "RAIDER",
         Kind::Mortar => "MORTAR",
         Kind::Sapper => "SAPPER",
+        Kind::Turret => "TURRET",
         Kind::Mineral => "MINERAL",
     }
 }
@@ -2024,7 +2076,8 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
         if e.team != w.my_team && w.vis_at(e.pos) != 2 {
             continue;
         }
-        draw_building(c, e, w2s(e.pos), e.team == w.my_team);
+        // Allies count as friendly here so their bars traffic-light too.
+        draw_building(c, e, w2s(e.pos), w.allied(w.my_team, e.team));
     }
 
     // Remembered enemy structures: buildings scouted earlier whose ground has
@@ -2201,7 +2254,7 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
             }
         }
         if e.hp < e.max_hp {
-            draw_hpbar(c, sx, sy - r - 6, (r * 2 + 4).max(12), e.hp / e.max_hp, e.team == w.my_team);
+            draw_hpbar(c, sx, sy - r - 6, (r * 2 + 4).max(12), e.hp / e.max_hp, w.allied(w.my_team, e.team));
         }
     }
 
@@ -2295,6 +2348,10 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
         }
     }
 
+    // Ambient dust, drifting on the match's wind. Drawn just under the fog
+    // pass so the unexplored void stays black.
+    draw_dust(c, w, camx, camy);
+
     // ---- Fog of war: black out the unseen, dim what's only remembered. ----
     // `vis` holds one grid per faction back to back; read from the LOCAL
     // viewer's slice (as the minimap does), so a joining peer sees their own
@@ -2306,6 +2363,9 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
     let gx1 = (((camx + c.w) / cs) + 1).min(w.fog_w as i32 - 1);
     let gy1 = (((camy + c.h) / cs) + 1).min(w.fog_h as i32 - 1);
     let unseen = rgb(6, 7, 10);
+    // Film grain re-rolls its fleck positions ~9 times a second — fast enough
+    // to shimmer, slow enough not to strobe.
+    let grain_t = (w.time * 9.0) as u32;
     for gy in gy0..=gy1 {
         let row = fog_base + gy as usize * w.fog_w;
         for gx in gx0..=gx1 {
@@ -2317,6 +2377,16 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
             let sy = gy * cs - camy;
             if v == 0 {
                 c.fill_rect(sx, sy, cs, cs, unseen);
+                // A few faint flecks per cell so the unexplored void reads as
+                // drifting fog rather than dead black. Render-side only.
+                let mut h = grain_hash(gx, gy, grain_t);
+                for _ in 0..3 {
+                    let dx = (h & 0xFFFF) as i32 % cs;
+                    let dy = ((h >> 16) & 0xFFFF) as i32 % cs;
+                    let br = 0.05 + ((h >> 32) & 7) as f32 * 0.012;
+                    c.add_px(sx + dx, sy + dy, rgb(95, 115, 135), br);
+                    h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (h >> 29);
+                }
             } else {
                 c.fill_rect_a(sx, sy, cs, cs, unseen, 0.55);
             }
@@ -2408,6 +2478,43 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
     }
     if ui.menu {
         draw_menu(c, mouse);
+    }
+}
+
+/// Small stateless hash for cosmetic noise (fog grain): scrambles a fog cell
+/// and a time step into well-mixed bits. Render-side only — never sim state.
+fn grain_hash(gx: i32, gy: i32, t: u32) -> u64 {
+    let mut z = ((gx as u64) << 42) ^ ((gy as u64) << 21) ^ t as u64;
+    z = (z ^ (z >> 33)).wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    z = (z ^ (z >> 29)).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    z ^ (z >> 32)
+}
+
+/// Ambient dust: a sparse field of specks drifting on the match's wind. Each
+/// mote is pure math over its index hash and the clock — no per-frame state,
+/// no allocations — advected along `w.wind` at its own pace with a slow
+/// cross-wind wobble, wrapped at the map edge, and twinkling so it reads as
+/// floating dust rather than stuck pixels. Cosmetic only; the sim never looks.
+fn draw_dust(c: &mut Canvas, w: &World, camx: i32, camy: i32) {
+    // Density scales with map area so every player count feels the same.
+    let n = ((w.world_w * w.world_h) / (140.0 * 140.0)) as u32;
+    let t = w.time;
+    for k in 0..n {
+        let h = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let hx = ((h >> 16) & 0xFFFF) as f32 / 65536.0;
+        let hy = ((h >> 32) & 0xFFFF) as f32 / 65536.0;
+        let hp = ((h >> 48) & 0xFFFF) as f32 / 65536.0;
+        let speed = 8.0 + hp * 10.0;
+        let wob = (t * (0.5 + hp) + hp * 12.0).sin() * 10.0;
+        let x = (hx * w.world_w + (w.wind.x * t * speed) - w.wind.y * wob).rem_euclid(w.world_w);
+        let y = (hy * w.world_h + (w.wind.y * t * speed) + w.wind.x * wob).rem_euclid(w.world_h);
+        let sx = x as i32 - camx;
+        let sy = y as i32 - camy;
+        if sx < 0 || sy < 0 || sx >= c.w || sy >= c.h {
+            continue;
+        }
+        let tw = (t * (0.6 + hp * 1.4) + hp * 6.28).sin() * 0.5 + 0.5;
+        c.add_px(sx, sy, rgb(170, 195, 185), 0.05 + 0.11 * tw);
     }
 }
 
@@ -2585,6 +2692,22 @@ fn draw_building(c: &mut Canvas, e: &world::Ent, (sx, sy): (i32, i32), mine: boo
             c.fill_circle_add(sx, sy, 3, rgb(150, 255, 180), 0.5);
             c.fill_circle(sx, sy, 1, rgb(210, 255, 220));
         }
+        Kind::Turret => {
+            // Gun emplacement: a round mount on the pad and a barrel that
+            // tracks whatever it last shot at (the sim turns `facing` to fire).
+            let f = e.facing;
+            let rf = r as f32;
+            c.fill_circle(sx, sy, r - 3, dk); // mount ring
+            c.fill_circle(sx, sy, r - 5, fill);
+            c.fill_circle(sx - 1, sy - 1, (r - 8).max(1), hi); // glint
+            let bl = rf + 6.0;
+            let (bmx, bmy) = ((sx as f32 + f.x * bl * 0.55) as i32, (sy as f32 + f.y * bl * 0.55) as i32);
+            c.fill_orect(bmx, bmy, bl * 0.55, 2.0, f, ec); // barrel
+            let (mzx, mzy) = ((sx as f32 + f.x * (bl + 1.0)) as i32, (sy as f32 + f.y * (bl + 1.0)) as i32);
+            c.fill_circle_add(mzx, mzy, 2, warm, 0.5); // muzzle ember
+            c.fill_circle_add(sx, sy, 2, rgb(255, 90, 60), 0.8); // live light
+            c.fill_circle(sx, sy, 1, rgb(255, 235, 225));
+        }
         _ => {}
     }
 
@@ -2695,7 +2818,7 @@ fn draw_minimap(c: &mut Canvas, w: &World) {
         let (col, sz) = match e.kind {
             Kind::Mineral => (MINERAL, 1),
             Kind::Base => (edge_of(e.team), 3),
-            Kind::Barracks | Kind::Factory | Kind::Depot => (edge_of(e.team), 2),
+            Kind::Barracks | Kind::Factory | Kind::Depot | Kind::Turret => (edge_of(e.team), 2),
             Kind::Tank | Kind::Mortar => (fill_of(e.team), 2),
             _ => (fill_of(e.team), 1),
         };
@@ -2764,6 +2887,21 @@ fn draw_minimap(c: &mut Canvas, w: &World) {
         c.circle(px, py, 3 + (t * 8.0) as i32, fade);
         c.fill_rect(px - 1, py - 1, 3, 3, col); // bright core, easy to spot
     }
+
+    // UNDER ATTACK alarms: a pulsing red ring at each site taking fire, kept
+    // ringing while hits keep landing. Drawn last so neither the fog overlay
+    // nor the viewport rectangle can bury the alarm.
+    for &(p, life) in &w.attack_pings {
+        let px = mmx + (p.x * sx) as i32;
+        let py = mmy + (p.y * sy) as i32;
+        let pulse = (w.time * 6.0).sin() * 0.5 + 0.5;
+        let fade = life.clamp(0.0, 1.0); // steady while fresh, fades the last second
+        let ring = gfx::mix(rgb(60, 20, 16), rgb(255, 80, 60), (0.45 + 0.55 * pulse) * fade);
+        let r = 4 + (pulse * 3.0) as i32;
+        c.circle(px, py, r, ring);
+        c.circle(px, py, r + 1, ring);
+        c.fill_rect(px - 1, py - 1, 3, 3, gfx::mix(rgb(16, 18, 14), rgb(255, 120, 90), fade));
+    }
 }
 
 fn draw_hud(c: &mut Canvas, w: &World, ui: &Ui) {
@@ -2799,11 +2937,11 @@ fn draw_hud(c: &mut Canvas, w: &World, ui: &Ui) {
 
     let mins = (w.time as i32) / 60;
     let secs = (w.time as i32) % 60;
-    // How many rival factions are still in the game.
+    // How many rival factions are still in the game (allies don't count).
     let rivals = (0..w.factions)
         .filter(|&f| {
             let t = Team::from_idx(f);
-            t != w.my_team && w.faction_alive(t)
+            w.hostile(w.my_team, t) && w.faction_alive(t)
         })
         .count();
     let right = format!("{} RIVAL{}   {}:{:02}", rivals, if rivals == 1 { "" } else { "S" }, mins, secs);
@@ -2831,7 +2969,7 @@ fn draw_hud(c: &mut Canvas, w: &World, ui: &Ui) {
     }
 
     // Selection readout + contextual hint.
-    let (sw, sa, sbase, sbarr, sfact, sdepot) = w.selected_kinds();
+    let (sw, sa, sbase, sbarr, sfact, sdepot, sturret) = w.selected_kinds();
     let mut line = String::new();
     if sbase {
         line.push_str("COMMAND CENTER: [W] WORKER  ");
@@ -2845,11 +2983,14 @@ fn draw_hud(c: &mut Canvas, w: &World, ui: &Ui) {
     if sdepot {
         line.push_str("SUPPLY DEPOT: RAISES SUPPLY CAP  ");
     }
+    if sturret {
+        line.push_str("TURRET: AUTO-FIRES AT ENEMIES IN RANGE  ");
+    }
     if sbase || sbarr || sfact {
         line.push_str("(RIGHT-CLICK BLDG CANCELS QUEUE)  ");
     }
     if sw > 0 {
-        line.push_str(&format!("{} WORKER: [B]ARRACKS [F]ACTORY [D]EPOT [C]CENTER  ", sw));
+        line.push_str(&format!("{} WORKER: [B]ARRACKS [F]ACTORY [D]EPOT [C]CENTER [T]URRET  ", sw));
     }
     if sa > 0 {
         line.push_str(&format!("{} ARMY: [A] ATTACK-MOVE  [S] STOP  ", sa));
@@ -2871,7 +3012,7 @@ fn draw_help(c: &mut Canvas) {
         "A   S          ATTACK-MOVE   STOP",
         "ESC            PAUSE MENU (RESUME / SURRENDER / QUIT)",
         "",
-        "WORKER:  [B]ARRACKS [F]ACTORY [D]EPOT [C]COMMAND CTR",
+        "WORKER:  [B]ARRACKS [F]ACTORY [D]EPOT [C]CMD [T]URRET",
         "  (SHIFT-CLICK WHILE PLACING TO CHAIN SEVERAL BUILDS)",
         "COMMAND CENTER: [W] WORKER      DEPOT: RAISES SUPPLY",
         "BARRACKS: [E] SOLDIER [Y] PYRO [G] SAPPER",
@@ -2883,6 +3024,9 @@ fn draw_help(c: &mut Canvas) {
         "RAIDER: FAST, FRAGILE, HUNTS WORKERS AND FLANKS.",
         "MORTAR: LONG SIEGE SPLASH, BUT A DEAD ZONE UP CLOSE.",
         "SAPPER: SUICIDE BOMBER - CHARGES IN, BIG BLAST.",
+        "TURRET: STATIC DEFENSE (NEEDS BARRACKS). GUARDS A",
+        "MINERAL LINE; A MORTAR OUTRANGES IT.  2V2: ALLIES",
+        "SHARE VISION AND WIN TOGETHER - REPAIR THEIR BLDGS.",
         "HIGH GROUND: MORE SIGHT + RANGE. CLIFFS BLOCK THE",
         "VIEW FROM BELOW - HOLD A RAMP TO AMBUSH. EXPAND AND",
         "WATCH YOUR SUPPLY.   GOAL: RAZE EVERY ENEMY BASE",
@@ -2982,5 +3126,35 @@ mod tests {
         render(&mut c, &w, &ui, v2(0.0, 0.0));
         // The base pixel must not be the exact "never seen" fog fill.
         assert_ne!(c.buf[240 * 640 + 320], rgb(6, 7, 10));
+    }
+
+    /// Smoke: a 2v2 frame with a selected turret, a placement ghost, and the
+    /// help overlay all draw without panicking (exercises the turret art's
+    /// oriented-rect math and the team-aware HUD paths).
+    #[test]
+    fn renders_a_team_match_with_a_turret() {
+        let mut w = World::new_match_teams(5, 4, [false, true, true, true], Team::Player, false, [0, 1, 0, 1]);
+        let bp = w
+            .ents
+            .iter()
+            .find(|e| e.kind == Kind::Base && e.team == Team::Player)
+            .unwrap()
+            .pos;
+        let t = w.spawn(Kind::Turret, Team::Player, bp.add(v2(90.0, -70.0)));
+        w.ents[t].selected = true;
+        w.attack_pings.push((bp, 3.0)); // exercise the minimap alarm ring
+        w.update(1.0 / 60.0);
+        let mut c = Canvas::new(640, 480);
+        w.cam = v2(bp.x - 320.0, bp.y - 240.0);
+        let ui = Ui {
+            drag_start: None,
+            dragging: false,
+            build_mode: Some(Kind::Turret),
+            attack_pending: false,
+            show_help: true,
+            menu: false,
+        };
+        render(&mut c, &w, &ui, v2(320.0, 240.0));
+        assert!(c.buf.iter().any(|&px| px != rgb(6, 7, 10)), "the frame drew something");
     }
 }

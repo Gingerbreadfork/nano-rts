@@ -82,6 +82,7 @@ pub enum Kind {
     Raider,  // fast light vehicle: harass, flanks, runs down workers
     Mortar,  // siege: very long lobbed splash, but a dead zone up close
     Sapper,  // suicide bomber: charges in and detonates for a big blast
+    Turret,  // static defense: auto-fires at anything hostile in range
     Mineral,
 }
 
@@ -262,6 +263,11 @@ pub struct World {
     pub factions: usize,
     /// Which factions are AI-controlled (the rest are humans).
     pub is_ai: [bool; MAX_FACTIONS],
+    /// Alliance id per faction. Factions sharing an id are allies: they never
+    /// target each other, share vision, and win or lose together. The default
+    /// [0,1,2,3] (everyone their own id) is a free-for-all. Static match
+    /// config, fixed before the first tick and identical on every peer.
+    pub alliance: [u8; MAX_FACTIONS],
     /// Map dimensions (scale with the faction count).
     pub world_w: f32,
     pub world_h: f32,
@@ -318,7 +324,18 @@ pub struct World {
     /// ghosts where the fog has gone stale). Per-viewer, keyed to `my_team`,
     /// so it is NOT checksummed and must never feed a sim decision.
     pub seen_buildings: Vec<(V2, Kind, Team)>,
+    /// Sites where the LOCAL player's things are taking fire: (pos, seconds
+    /// left). Drawn as pulsing alarm rings on the minimap. Per-viewer display
+    /// state like `kills` — never checksummed, never a sim input.
+    pub attack_pings: Vec<(V2, f32)>,
+    /// Fixed per-match wind heading for cosmetic drift (dust motes). Derived
+    /// from the seed so every peer sees the same sky; never checksummed and
+    /// never read by the sim, so platform trig differences are harmless.
+    pub wind: V2,
 }
+
+/// How long a minimap attack alarm keeps ringing after the last hit.
+const ATTACK_PING_LIFE: f32 = 3.0;
 
 // ---- per-kind stats -------------------------------------------------------
 
@@ -335,6 +352,7 @@ pub fn radius(k: Kind) -> f32 {
         Kind::Raider => 9.0,
         Kind::Mortar => 11.0,
         Kind::Sapper => 8.0,
+        Kind::Turret => 13.0,
         Kind::Mineral => 14.0,
     }
 }
@@ -350,6 +368,7 @@ fn sight(k: Kind) -> f32 {
         Kind::Raider => 240.0, // fast eyes — a natural scout
         Kind::Mortar => 235.0, // sees far to lob far
         Kind::Sapper => 185.0,
+        Kind::Turret => 260.0, // a watchtower as much as a gun
         Kind::Mineral => 0.0,
     }
 }
@@ -378,6 +397,7 @@ fn max_hp(k: Kind) -> f32 {
         Kind::Raider => 70.0,
         Kind::Mortar => 85.0, // a glass siege weapon
         Kind::Sapper => 45.0, // fragile; it only needs to reach you once
+        Kind::Turret => 320.0,
         Kind::Mineral => 1.0,
     }
 }
@@ -390,6 +410,7 @@ fn damage(k: Kind) -> f32 {
         Kind::Raider => 16.0,
         Kind::Mortar => 30.0, // a heavy shell, lands as splash
         Kind::Sapper => 0.0,  // no gun — all its damage is the detonation
+        Kind::Turret => 12.0,
         _ => 0.0,
     }
 }
@@ -403,6 +424,7 @@ fn atk_range(k: Kind) -> f32 {
         Kind::Raider => 56.0,
         Kind::Mortar => 215.0, // outranges everything
         Kind::Sapper => 14.0,  // the range at which it touches off
+        Kind::Turret => 135.0, // outguns line units; a Mortar still outranges it
         _ => 0.0,
     }
 }
@@ -427,6 +449,7 @@ fn atk_cd(k: Kind) -> f32 {
         Kind::Raider => 0.8,
         Kind::Mortar => 2.4, // a slow reload between shells
         Kind::Sapper => 0.1,
+        Kind::Turret => 0.8,
         _ => 0.0,
     }
 }
@@ -439,6 +462,7 @@ fn aggro(k: Kind) -> f32 {
         Kind::Raider => 175.0,
         Kind::Mortar => 240.0, // engages from way out
         Kind::Sapper => 205.0, // charges the nearest threat
+        Kind::Turret => 165.0, // just past its reach; it can't chase anyway
         _ => 0.0,
     }
 }
@@ -470,6 +494,7 @@ pub fn cost(k: Kind) -> u32 {
         Kind::Barracks => 120,
         Kind::Factory => 160,
         Kind::Depot => 75,
+        Kind::Turret => 100,
         Kind::Base => 300, // expansion
         _ => 0,
     }
@@ -486,6 +511,7 @@ pub fn build_time(k: Kind) -> f32 {
         Kind::Barracks => 10.0,
         Kind::Factory => 13.0,
         Kind::Depot => 6.0,
+        Kind::Turret => 8.0,
         Kind::Base => 28.0,
         _ => 0.0,
     }
@@ -522,6 +548,7 @@ pub fn kind_from_u8(b: u8) -> Kind {
         8 => Kind::Raider,
         9 => Kind::Mortar,
         10 => Kind::Sapper,
+        11 => Kind::Turret,
         _ => Kind::Mineral,
     }
 }
@@ -533,13 +560,13 @@ fn is_mover(k: Kind) -> bool {
     )
 }
 pub fn is_building(k: Kind) -> bool {
-    matches!(k, Kind::Base | Kind::Barracks | Kind::Factory | Kind::Depot)
+    matches!(k, Kind::Base | Kind::Barracks | Kind::Factory | Kind::Depot | Kind::Turret)
 }
 fn is_combat(k: Kind) -> bool {
     // Things that fire a straight tracer (drives the tracer/muzzle visuals). The
     // Sapper detonates and the Mortar lobs an arcing shell, so both get their own
     // bespoke effects instead.
-    matches!(k, Kind::Soldier | Kind::Tank | Kind::Pyro | Kind::Raider)
+    matches!(k, Kind::Soldier | Kind::Tank | Kind::Pyro | Kind::Raider | Kind::Turret)
 }
 /// An army unit (everything that fights, excludes workers) — for Ctrl+A and HUD.
 pub fn is_army(k: Kind) -> bool {
@@ -586,15 +613,45 @@ impl World {
         World::new_match(seed, 2, [false, true, false, false], Team::Player, false)
     }
 
+    /// Same side? A faction is always allied with itself; distinct factions are
+    /// allies when their alliance ids match. Neutral is nobody's ally.
+    #[inline]
+    pub fn allied(&self, a: Team, b: Team) -> bool {
+        if a == b {
+            return true;
+        }
+        let (ai, bi) = (a.idx(), b.idx());
+        ai < MAX_FACTIONS && bi < MAX_FACTIONS && self.alliance[ai] == self.alliance[bi]
+    }
+
+    /// Valid target? Neither side neutral, and not on the same alliance.
+    #[inline]
+    pub fn hostile(&self, a: Team, b: Team) -> bool {
+        a != Team::Neutral && b != Team::Neutral && !self.allied(a, b)
+    }
+
     /// The map size for `factions` players (grows with the count).
     pub fn map_size(factions: usize) -> (f32, f32) {
         let s = 1.0 + 0.18 * (factions.max(2) - 2) as f32;
         (WORLD_W * s, WORLD_H * s)
     }
 
+    /// Build a free-for-all match (every faction its own alliance).
+    pub fn new_match(seed: u64, factions: usize, is_ai: [bool; MAX_FACTIONS], my_team: Team, versus: bool) -> World {
+        World::new_match_teams(seed, factions, is_ai, my_team, versus, [0, 1, 2, 3])
+    }
+
     /// Build a match with `factions` (2..=4) factions; `is_ai[i]` marks AI slots;
     /// `my_team` is the local viewer. `versus` flags a networked game.
-    pub fn new_match(seed: u64, factions: usize, is_ai: [bool; MAX_FACTIONS], my_team: Team, versus: bool) -> World {
+    /// `alliance` assigns each faction a team id — equal ids fight together.
+    pub fn new_match_teams(
+        seed: u64,
+        factions: usize,
+        is_ai: [bool; MAX_FACTIONS],
+        my_team: Team,
+        versus: bool,
+        alliance: [u8; MAX_FACTIONS],
+    ) -> World {
         let factions = factions.clamp(2, MAX_FACTIONS);
         let (world_w, world_h) = World::map_size(factions);
         let fog_cell = 40.0f32;
@@ -602,12 +659,15 @@ impl World {
         let fog_h = (world_h / fog_cell).ceil() as usize;
         let tw = (world_w / TCELL).ceil() as usize;
         let th = (world_h / TCELL).ceil() as usize;
+        let wind_ang =
+            (mix_seed(seed ^ 0x00D0_5EA5_0F7E_11E5) >> 40) as f32 / (1u64 << 24) as f32 * std::f32::consts::TAU;
         let mut w = World {
             ents: Vec::new(),
             next_id: 1,
             minerals: [50; MAX_FACTIONS],
             factions,
             is_ai,
+            alliance,
             world_w,
             world_h,
             my_team,
@@ -644,6 +704,8 @@ impl World {
             attack_warn: 0.0,
             kills: 0,
             seen_buildings: Vec::new(),
+            attack_pings: Vec::new(),
+            wind: v2(wind_ang.cos(), wind_ang.sin()),
         };
         w.setup();
         w
@@ -719,7 +781,9 @@ impl World {
                 let mut best = center;
                 let mut bd = f32::MAX;
                 for (fj, &op) in base_pos.iter().enumerate().take(n) {
-                    if fj != fi && op.dist_sq(bp) < bd {
+                    // The opening objective is the nearest base it may actually
+                    // attack — never an ally's.
+                    if self.hostile(Team::from_idx(fi), Team::from_idx(fj)) && op.dist_sq(bp) < bd {
                         bd = op.dist_sq(bp);
                         best = op;
                     }
@@ -733,8 +797,12 @@ impl World {
         let mybase = base_pos[self.my_team.idx().min(n - 1)];
         self.cam = mybase.sub(v2(640.0, 360.0));
         self.clamp_cam(1280.0, 720.0);
-        let foes = n - 1;
-        self.msg(&format!("FREE-FOR-ALL - {} RIVAL{} - LAST ONE STANDING WINS", foes, if foes == 1 { "" } else { "S" }));
+        let foes = (0..n).filter(|&f| self.hostile(self.my_team, Team::from_idx(f))).count();
+        if foes < n - 1 {
+            self.msg(&format!("TEAM BATTLE - {} RIVAL{} - LAST TEAM STANDING WINS", foes, if foes == 1 { "" } else { "S" }));
+        } else {
+            self.msg(&format!("FREE-FOR-ALL - {} RIVAL{} - LAST ONE STANDING WINS", foes, if foes == 1 { "" } else { "S" }));
+        }
     }
 
     fn mineral_field(&mut self, center: V2, n: i32) {
@@ -891,7 +959,7 @@ impl World {
         let mut best = None;
         let mut bd = r * r;
         for e in &self.ents {
-            if e.team == self.my_team || e.team == Team::Neutral || e.hp <= 0.0 {
+            if e.hp <= 0.0 || !self.hostile(self.my_team, e.team) {
                 continue;
             }
             let d = e.pos.dist_sq(pt);
@@ -969,10 +1037,29 @@ impl World {
         self.can_build_team(self.my_team, kind, pt)
     }
 
+    /// Tech gate for worker-placed buildings. A Turret needs a finished
+    /// Barracks — otherwise a 100-mineral proxy turret in the opening minute
+    /// would be unanswerable. Everything else is free to place. Enforced here
+    /// at the one choke point every placement path (UI, AI, wire) runs through.
+    pub fn tech_ok(&self, team: Team, kind: Kind) -> bool {
+        match kind {
+            Kind::Turret => self.ents.iter().any(|e| {
+                e.team == team && e.kind == Kind::Barracks && e.build_left <= 0.0 && e.hp > 0.0
+            }),
+            _ => true,
+        }
+    }
+
     /// Building placement: spend, validate spacing, send the worker. Replaces any
     /// in-progress build chain (a plain, single build).
     pub fn order_build(&mut self, worker_idx: usize, kind: Kind, site: V2) -> bool {
         let team = self.ents[worker_idx].team;
+        if !self.tech_ok(team, kind) {
+            if team == self.my_team {
+                self.msg("TURRET NEEDS A BARRACKS");
+            }
+            return false;
+        }
         if self.team_min(team) < cost(kind) || !self.can_build_team(team, kind, site) {
             return false;
         }
@@ -988,6 +1075,12 @@ impl World {
     /// the worker isn't already building.
     pub fn queue_build(&mut self, worker_idx: usize, kind: Kind, site: V2) -> bool {
         let team = self.ents[worker_idx].team;
+        if !self.tech_ok(team, kind) {
+            if team == self.my_team {
+                self.msg("TURRET NEEDS A BARRACKS");
+            }
+            return false;
+        }
         if self.team_min(team) < cost(kind) || !self.can_build_team(team, kind, site) {
             return false;
         }
@@ -1029,7 +1122,7 @@ impl World {
         let mut bd = within * within;
         let mut bk = 0u64;
         for (i, e) in self.ents.iter().enumerate() {
-            if e.team == Team::Neutral || e.team == team || e.hp <= 0.0 {
+            if e.hp <= 0.0 || !self.hostile(team, e.team) {
                 continue;
             }
             let d = e.pos.dist_sq(p);
@@ -1406,13 +1499,14 @@ impl World {
 
     /// (workers, army units, has_base, has_barracks, has_factory) in the
     /// current selection — drives the contextual HUD hints.
-    pub fn selected_kinds(&self) -> (u32, u32, bool, bool, bool, bool) {
+    pub fn selected_kinds(&self) -> (u32, u32, bool, bool, bool, bool, bool) {
         let mut w = 0;
         let mut army = 0;
         let mut base = false;
         let mut barr = false;
         let mut fact = false;
         let mut depot = false;
+        let mut turret = false;
         for e in &self.ents {
             if !e.selected {
                 continue;
@@ -1424,10 +1518,11 @@ impl World {
                 Kind::Barracks => barr = true,
                 Kind::Factory => fact = true,
                 Kind::Depot => depot = true,
+                Kind::Turret => turret = true,
                 _ => {}
             }
         }
-        (w, army, base, barr, fact, depot)
+        (w, army, base, barr, fact, depot, turret)
     }
 
     /// Apply a serialized command for `team`. The one path all gameplay input
@@ -1533,13 +1628,13 @@ impl World {
         }
 
         let tinfo = target.map(|i| (self.ents[i].id, self.ents[i].team, self.ents[i].kind));
-        // A friendly, damaged, FINISHED building the click landed on — a repair
-        // target. A construction site is excluded: its build cost was already
-        // paid and its hp comes from the build ramp, so "repairing" it would
-        // burn minerals for nothing.
+        // A friendly (own or allied), damaged, FINISHED building the click
+        // landed on — a repair target. A construction site is excluded: its
+        // build cost was already paid and its hp comes from the build ramp, so
+        // "repairing" it would burn minerals for nothing.
         let repair_id = target
             .filter(|&ti| {
-                self.ents[ti].team == team
+                self.allied(team, self.ents[ti].team)
                     && is_building(self.ents[ti].kind)
                     && self.ents[ti].build_left <= 0.0
                     && self.ents[ti].hp < self.ents[ti].max_hp
@@ -1554,7 +1649,7 @@ impl World {
 
         if mine && sel.iter().any(|&i| is_mover(self.ents[i].kind)) {
             let (pt, col) = match tinfo {
-                Some((_, t, _)) if t != team && t != Team::Neutral => {
+                Some((_, t, _)) if self.hostile(team, t) => {
                     (self.ents[target.unwrap()].pos, crate::gfx::rgb(240, 90, 80))
                 }
                 Some((_, _, Kind::Mineral)) => {
@@ -1589,7 +1684,7 @@ impl World {
             }
             // Decide the order this unit should carry out.
             let new_order = match tinfo {
-                Some((tid, tteam, _)) if tteam != team && tteam != Team::Neutral => Order::Attack(tid),
+                Some((tid, tteam, _)) if self.hostile(team, tteam) => Order::Attack(tid),
                 Some((tid, _, Kind::Mineral)) if kind == Kind::Worker => Order::Gather(tid),
                 _ if kind == Kind::Worker && repair_id.is_some() => Order::Repair(repair_id.unwrap()),
                 _ => {
@@ -1646,6 +1741,7 @@ impl World {
         mix(self.next_id as u64);
         for fi in 0..self.factions {
             mix(self.minerals[fi] as u64);
+            mix(self.alliance[fi] as u64);
         }
         mix(self.time.to_bits() as u64);
         mix(self.rng);
@@ -2371,11 +2467,13 @@ impl World {
         let (fw, fh) = (self.fog_w as i32, self.fog_h as i32);
         let fog_w = self.fog_w;
         let (tw, th) = (self.tw, self.th);
-        // Snapshot sight sources, with a vision bonus for high-ground spotters.
+        // Snapshot sight sources — allied factions share vision, so anything an
+        // ally sees lights this grid too. Deterministic: alliance is static
+        // match config, identical on every peer.
         let srcs: Vec<(V2, f32, u8)> = self
             .ents
             .iter()
-            .filter(|e| e.team == team)
+            .filter(|e| e.team != Team::Neutral && self.allied(team, e.team))
             .map(|e| {
                 let elev = self.elev_at(e.pos);
                 let s = sight(e.kind) * if elev == 1 { 1.3 } else { 1.0 };
@@ -2496,7 +2594,7 @@ impl World {
             .ents
             .iter()
             .filter(|e| {
-                is_building(e.kind) && e.hp > 0.0 && e.team != self.my_team && e.team != Team::Neutral
+                is_building(e.kind) && e.hp > 0.0 && self.hostile(self.my_team, e.team)
             })
             .map(|e| (e.pos, e.kind, e.team))
             .collect();
@@ -2606,7 +2704,13 @@ impl World {
                 self.ents[i].cooldown -= dt;
             }
             let kind = self.ents[i].kind;
-            if !is_mover(kind) {
+            // Turrets fight too: they share the whole acquire/fire path below,
+            // they just never move (movement() skips non-movers). One under
+            // construction has no gun yet.
+            if !is_mover(kind) && kind != Kind::Turret {
+                continue;
+            }
+            if kind == Kind::Turret && self.ents[i].build_left > 0.0 {
                 continue;
             }
             let team = self.ents[i].team;
@@ -2659,7 +2763,7 @@ impl World {
                         let b2 = blast * blast;
                         for k2 in 0..self.ents.len() {
                             let e = &self.ents[k2];
-                            if e.hp <= 0.0 || e.team == team || e.team == Team::Neutral {
+                            if e.hp <= 0.0 || !self.hostile(team, e.team) {
                                 continue;
                             }
                             let dd = e.pos.dist_sq(pos);
@@ -2678,7 +2782,7 @@ impl World {
                             let r2 = reach * reach;
                             for k2 in 0..self.ents.len() {
                                 let e = &self.ents[k2];
-                                if e.hp <= 0.0 || e.team == team || e.team == Team::Neutral {
+                                if e.hp <= 0.0 || !self.hostile(team, e.team) {
                                     continue;
                                 }
                                 let to = e.pos.sub(pos);
@@ -2705,8 +2809,7 @@ impl World {
                                 for k2 in 0..self.ents.len() {
                                     let e = &self.ents[k2];
                                     if e.hp > 0.0
-                                        && e.team != team
-                                        && e.team != Team::Neutral
+                                        && self.hostile(team, e.team)
                                         && e.pos.dist_sq(tpos) <= sp2
                                     {
                                         dmg.push((k2, dm, team));
@@ -2766,7 +2869,8 @@ impl World {
                         }
                     }
                     self.ents[i].goal = None;
-                } else {
+                } else if is_mover(kind) {
+                    // Close the distance (a turret just waits — it can't chase).
                     self.ents[i].goal = Some(tpos);
                 }
                 continue;
@@ -2861,8 +2965,10 @@ impl World {
         let team = self.ents[i].team;
         // A construction site never qualifies: its cost is already paid and its
         // hp rides the build ramp, so repairing it would just burn minerals.
+        // Allied buildings qualify — patching up a teammate is real teamwork
+        // (the repairing faction pays, as with its own).
         let bi = self.index_of(bid).filter(|&b| {
-            self.ents[b].team == team
+            self.allied(team, self.ents[b].team)
                 && is_building(self.ents[b].kind)
                 && self.ents[b].build_left <= 0.0
                 && self.ents[b].hp > 0.0
@@ -2974,8 +3080,7 @@ impl World {
             if was_alive
                 && self.ents[i].hp <= 0.0
                 && from == self.my_team
-                && self.ents[i].team != self.my_team
-                && self.ents[i].team != Team::Neutral
+                && self.hostile(self.my_team, self.ents[i].team)
                 && is_mover(self.ents[i].kind)
             {
                 self.kills += 1;
@@ -2984,10 +3089,28 @@ impl World {
             let pos = self.ents[i].pos;
             // Impact sparks at the point of contact.
             self.emit(pos, crate::gfx::rgb(255, 235, 170), 3, 90.0, 1.6, 0.2, 50.0, 6.0, true);
-            if self.ents[i].team == self.my_team && self.attack_warn <= 0.0 {
-                self.attack_warn = 6.0;
-                self.msg("UNDER ATTACK!");
-                self.sfx(Sfx::Alarm);
+            if self.ents[i].team == self.my_team {
+                // Minimap alarm: mark the site taking fire, or refresh a ring
+                // already covering it so a running battle is one alarm, not a
+                // stack. Per-viewer display state — never a sim input.
+                const NEAR2: f32 = 320.0 * 320.0;
+                match self.attack_pings.iter_mut().find(|a| a.0.dist_sq(pos) < NEAR2) {
+                    Some(a) => {
+                        a.0 = pos;
+                        a.1 = ATTACK_PING_LIFE;
+                    }
+                    None => {
+                        self.attack_pings.push((pos, ATTACK_PING_LIFE));
+                        if self.attack_pings.len() > 6 {
+                            self.attack_pings.remove(0); // bounded: oldest alarm yields
+                        }
+                    }
+                }
+                if self.attack_warn <= 0.0 {
+                    self.attack_warn = 6.0;
+                    self.msg("UNDER ATTACK!");
+                    self.sfx(Sfx::Alarm);
+                }
             }
         }
     }
@@ -3131,6 +3254,10 @@ impl World {
             p.1 -= dt;
         }
         self.pings.retain(|p| p.1 > 0.0);
+        for a in self.attack_pings.iter_mut() {
+            a.1 -= dt;
+        }
+        self.attack_pings.retain(|a| a.1 > 0.0);
         for m in self.messages.iter_mut() {
             m.1 -= dt;
         }
@@ -3151,30 +3278,32 @@ impl World {
     }
 
     fn check_over(&mut self) {
-        // Count surviving factions (a faction is out once it has nothing left).
-        let mut alive = 0usize;
-        let mut last = Team::Neutral;
-        for fi in 0..self.factions {
-            let t = Team::from_idx(fi);
-            if self.faction_alive(t) {
-                alive += 1;
-                last = t;
-            }
-        }
-        let my_alive = self.faction_alive(self.my_team);
-        // Local result for the UI: defeat the moment my faction is wiped, victory
-        // when I'm the sole survivor.
-        if !my_alive {
+        // Surviving factions (a faction is out once it has nothing left).
+        let alive: Vec<Team> = (0..self.factions)
+            .map(Team::from_idx)
+            .filter(|&t| self.faction_alive(t))
+            .collect();
+        // Sides win and lose together: my side is up while ANY allied faction
+        // (mine included) still stands, and has won once every survivor is an
+        // ally. In a free-for-all each faction is its own alliance, so this is
+        // exactly the old per-faction rule.
+        let side_alive = alive.iter().any(|&t| self.allied(self.my_team, t));
+        let side_won = side_alive && alive.iter().all(|&t| self.allied(self.my_team, t));
+        if !side_alive {
             self.over = -1;
-        } else if alive <= 1 {
+        } else if side_won {
             self.over = 1;
         }
-        // The match (and the sim) ends only when one faction remains — except in
-        // single-player, where losing my faction ends it immediately.
-        if alive <= 1 || (!my_alive && !self.versus) {
+        // The match (and the sim) ends when the survivors are all one side —
+        // except in single-player, where my whole side falling ends it at once.
+        // (A dead player with a live ally spectates the fight to its end.)
+        let one_side_left = match alive.first() {
+            Some(&f) => alive.iter().all(|&t| self.allied(f, t)),
+            None => true,
+        };
+        if one_side_left || (!side_alive && !self.versus) {
             self.match_over = true;
         }
-        let _ = last;
     }
 }
 
@@ -4314,6 +4443,186 @@ mod tests {
                 .all(|e| !(e.selected && e.team != Team::Player)),
             "Ctrl+A only grabs your own units"
         );
+    }
+
+    // ---- turrets ------------------------------------------------------
+
+    #[test]
+    fn turret_autofires_at_an_enemy_in_range() {
+        let mut w = World::new(5);
+        w.flatten_terrain();
+        w.spawn(Kind::Turret, Team::Player, v2(900.0, 900.0));
+        let s = w.spawn(Kind::Soldier, Team::Enemy, v2(1000.0, 900.0));
+        let sid = w.ents[s].id;
+        for _ in 0..120 {
+            w.update(1.0 / 60.0);
+        }
+        let hurt = w
+            .index_of(sid)
+            .map(|i| w.ents[i].hp < max_hp(Kind::Soldier))
+            .unwrap_or(true); // already dead counts
+        assert!(hurt, "a turret should engage a soldier parked in range");
+    }
+
+    #[test]
+    fn turret_holds_fire_while_under_construction() {
+        let mut w = World::new(5);
+        w.flatten_terrain();
+        let t = w.spawn(Kind::Turret, Team::Player, v2(900.0, 900.0));
+        w.ents[t].build_left = 8.0;
+        w.ents[t].hp = 40.0;
+        // A worker parks in range (workers never aggro on their own).
+        let v = w.spawn(Kind::Worker, Team::Enemy, v2(980.0, 900.0));
+        let vid = w.ents[v].id;
+        for _ in 0..60 {
+            w.update(1.0 / 60.0); // 1s: the shell is still rising the whole time
+        }
+        let i = w.index_of(vid).expect("nothing should have shot the worker");
+        assert_eq!(w.ents[i].hp, max_hp(Kind::Worker), "a rising turret has no gun");
+    }
+
+    #[test]
+    fn turret_placement_requires_a_finished_barracks() {
+        let mut w = World::new(5);
+        w.flatten_terrain();
+        let wi = a_player_worker(&w);
+        w.minerals[0] = 1000;
+        let site = v2(900.0, 900.0);
+        assert!(!w.order_build(wi, Kind::Turret, site), "no barracks yet");
+        // A rising barracks doesn't count either — only a finished one.
+        let b = w.spawn(Kind::Barracks, Team::Player, v2(700.0, 900.0));
+        w.ents[b].build_left = 5.0;
+        assert!(!w.order_build(wi, Kind::Turret, site), "barracks still rising");
+        w.ents[b].build_left = 0.0;
+        assert!(w.order_build(wi, Kind::Turret, site), "finished barracks unlocks the turret");
+    }
+
+    #[test]
+    fn damage_raises_one_attack_ping_and_it_decays() {
+        let mut w = World::new(5);
+        w.flatten_terrain();
+        let spot = v2(900.0, 900.0);
+        w.spawn(Kind::Worker, Team::Player, spot);
+        let s = w.spawn(Kind::Soldier, Team::Enemy, v2(960.0, 900.0));
+        let sid = w.ents[s].id;
+        for _ in 0..90 {
+            w.update(1.0 / 60.0); // 1.5s: several hits land on the worker
+        }
+        assert_eq!(
+            w.attack_pings.len(),
+            1,
+            "repeat hits on one site refresh the alarm, not stack it"
+        );
+        assert!(w.attack_pings[0].0.dist(spot) < 400.0, "the alarm marks the battle");
+        // The attacker falls; with no fresh hits the alarm rings out and fades.
+        if let Some(i) = w.index_of(sid) {
+            w.ents[i].hp = -1.0;
+        }
+        for _ in 0..(60 * 4) {
+            w.update(1.0 / 60.0);
+        }
+        assert!(w.attack_pings.is_empty(), "a stale alarm must fade away");
+    }
+
+    // ---- team games -----------------------------------------------------
+
+    /// A 2v2: the human (faction 0) + the green AI (faction 2) against the
+    /// red + amber AIs (factions 1 and 3).
+    fn team_world() -> World {
+        World::new_match_teams(11, 4, [false, true, true, true], Team::Player, false, [0, 1, 0, 1])
+    }
+
+    #[test]
+    fn allies_do_not_engage_each_other() {
+        let mut w = team_world();
+        w.flatten_terrain();
+        let p = v2(w.world_w * 0.5 + 300.0, w.world_h * 0.5 + 260.0);
+        let a = w.spawn(Kind::Soldier, Team::Player, p);
+        let b = w.spawn(Kind::Soldier, Team::Faction2, p.add(v2(30.0, 0.0)));
+        let (aid, bid) = (w.ents[a].id, w.ents[b].id);
+        for _ in 0..90 {
+            w.update(1.0 / 60.0);
+        }
+        for id in [aid, bid] {
+            let i = w.index_of(id).expect("allied soldiers must both survive");
+            assert_eq!(w.ents[i].hp, max_hp(Kind::Soldier), "allies must not auto-engage");
+        }
+    }
+
+    #[test]
+    fn right_click_on_an_ally_moves_instead_of_attacking() {
+        let mut w = team_world();
+        w.flatten_terrain();
+        let p = v2(w.world_w * 0.5 + 300.0, w.world_h * 0.5 + 260.0);
+        let mine = w.spawn(Kind::Soldier, Team::Player, p);
+        let ally = w.spawn(Kind::Soldier, Team::Faction2, p.add(v2(60.0, 0.0)));
+        let mid = w.ents[mine].id;
+        w.ents[mine].selected = true;
+        let target = w.ents[ally].pos;
+        w.command(target, false);
+        let i = w.index_of(mid).unwrap();
+        assert!(
+            matches!(w.ents[i].order, Order::Move(_)),
+            "an ally is not an attack target"
+        );
+    }
+
+    #[test]
+    fn allies_share_vision() {
+        let mut w = team_world();
+        w.update(1.0 / 60.0); // one tick fills every faction's fog grid
+        let ally_base = w
+            .ents
+            .iter()
+            .find(|e| e.kind == Kind::Base && e.team == Team::Faction2)
+            .unwrap()
+            .pos;
+        assert_eq!(w.team_vis_at(Team::Player, ally_base), 2, "ally sight lights my grid");
+        let foe_base = w
+            .ents
+            .iter()
+            .find(|e| e.kind == Kind::Base && e.team == Team::Enemy)
+            .unwrap()
+            .pos;
+        assert_eq!(w.team_vis_at(Team::Player, foe_base), 0, "enemies stay dark");
+    }
+
+    #[test]
+    fn team_wins_when_both_rivals_fall() {
+        let mut w = team_world();
+        for e in w.ents.iter_mut() {
+            if matches!(e.team, Team::Enemy | Team::Faction3) && is_building(e.kind) {
+                e.hp = -1.0;
+            }
+        }
+        w.update(1.0 / 60.0);
+        assert_eq!(w.over, 1, "every survivor is allied with me: victory");
+        assert!(w.match_over);
+    }
+
+    #[test]
+    fn a_dead_player_with_a_live_ally_spectates_to_the_end() {
+        let mut w = team_world();
+        for e in w.ents.iter_mut() {
+            if e.team == Team::Player && is_building(e.kind) {
+                e.hp = -1.0;
+            }
+        }
+        w.update(1.0 / 60.0);
+        assert_eq!(w.over, 0, "the side still fights while the ally stands");
+        assert!(!w.match_over, "a team match runs until one side remains");
+    }
+
+    #[test]
+    fn team_match_is_deterministic() {
+        let run = || {
+            let mut w = team_world();
+            for _ in 0..600 {
+                w.update(1.0 / 60.0);
+            }
+            w.checksum()
+        };
+        assert_eq!(run(), run(), "alliances must not perturb lockstep determinism");
     }
 }
 

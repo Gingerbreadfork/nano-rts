@@ -176,12 +176,29 @@ fn dec_cmd(r: &mut Rdr) -> Option<Cmd> {
 
 /// Wire messages. Step/Check carry the originating faction so the host can fan
 /// commands out to all peers; Welcome/Start set up the match during the lobby.
+/// `teams` packs each faction's alliance id into 2 bits (faction f at bits
+/// 2f..2f+1) — [0,1,2,3] is a free-for-all, [0,0,1,1] a 2v2.
 enum Msg {
     Step { faction: u8, step: u32, cmds: Vec<Cmd> },
     Check { faction: u8, step: u32, hash: u64 },
-    Welcome { faction: u8 },                        // host -> joiner on accept
-    Start { seed: u64, factions: u8, ai_mask: u8 }, // host -> joiner to begin
+    Welcome { faction: u8 },                                   // host -> joiner on accept
+    Start { seed: u64, factions: u8, ai_mask: u8, teams: u8 }, // host -> joiner to begin
 }
+
+/// Pack per-faction alliance ids (each 0..4) into the Start message's byte.
+pub fn pack_teams(alliance: &[u8; MAXF]) -> u8 {
+    (0..MAXF).fold(0u8, |b, f| b | ((alliance[f] & 3) << (f * 2)))
+}
+fn unpack_teams(b: u8) -> [u8; MAXF] {
+    let mut a = [0u8; MAXF];
+    for (f, slot) in a.iter_mut().enumerate() {
+        *slot = (b >> (f * 2)) & 3;
+    }
+    a
+}
+
+/// The free-for-all team byte (every faction its own alliance).
+const TEAMS_FFA: u8 = 0b11_10_01_00;
 
 fn enc_msg(m: &Msg) -> Vec<u8> {
     let mut b = Buf::default();
@@ -205,11 +222,12 @@ fn enc_msg(m: &Msg) -> Vec<u8> {
             b.u8(3);
             b.u8(*faction);
         }
-        Msg::Start { seed, factions, ai_mask } => {
+        Msg::Start { seed, factions, ai_mask, teams } => {
             b.u8(4);
             b.u64(*seed);
             b.u8(*factions);
             b.u8(*ai_mask);
+            b.u8(*teams);
         }
     }
     b.0
@@ -237,6 +255,7 @@ fn dec_msg(bytes: &[u8]) -> Option<Msg> {
             seed: r.u64()?,
             factions: r.u8()?,
             ai_mask: r.u8()?,
+            teams: r.u8()?,
         },
         _ => return None,
     })
@@ -444,6 +463,8 @@ pub struct Lockstep {
     pub seed: u64,
     pub factions: usize,
     pub is_ai: [bool; MAXF],
+    /// Alliance id per faction (from the host's Start message).
+    pub alliance: [u8; MAXF],
     pub my_faction: usize,
     pub sim_step: u32,
     sent_step: u32,
@@ -457,13 +478,22 @@ pub struct Lockstep {
 }
 
 impl Lockstep {
-    fn new(peers: Vec<Peer>, is_host: bool, seed: u64, factions: usize, is_ai: [bool; MAXF], my_faction: usize) -> Lockstep {
+    fn new(
+        peers: Vec<Peer>,
+        is_host: bool,
+        seed: u64,
+        factions: usize,
+        is_ai: [bool; MAXF],
+        alliance: [u8; MAXF],
+        my_faction: usize,
+    ) -> Lockstep {
         Lockstep {
             peers,
             is_host,
             seed,
             factions,
             is_ai,
+            alliance,
             my_faction,
             sim_step: 0,
             sent_step: 0,
@@ -483,9 +513,9 @@ impl Lockstep {
         let (mut stream, _addr) = listener.accept()?;
         stream.set_nodelay(true).ok();
         send_framed(&mut stream, &Msg::Welcome { faction: 1 })?;
-        send_framed(&mut stream, &Msg::Start { seed, factions: 2, ai_mask: 0 })?;
+        send_framed(&mut stream, &Msg::Start { seed, factions: 2, ai_mask: 0, teams: TEAMS_FFA })?;
         stream.set_nonblocking(true)?;
-        Ok(Lockstep::new(vec![Peer::new(stream, 1)], true, seed, 2, [false; MAXF], 0))
+        Ok(Lockstep::new(vec![Peer::new(stream, 1)], true, seed, 2, [false; MAXF], unpack_teams(TEAMS_FFA), 0))
     }
 
     /// Blocking 2-player joiner (faction 1). Used by the headless test.
@@ -498,8 +528,10 @@ impl Lockstep {
             Msg::Welcome { faction } if (1..MAXF as u8).contains(&faction) => faction as usize,
             _ => return Err(std::io::Error::new(ErrorKind::InvalidData, "bad welcome")),
         };
-        let (seed, factions, ai_mask) = match read_framed(&mut stream)? {
-            Msg::Start { seed, factions, ai_mask } if (2..=MAXF as u8).contains(&factions) => (seed, factions as usize, ai_mask),
+        let (seed, factions, ai_mask, teams) = match read_framed(&mut stream)? {
+            Msg::Start { seed, factions, ai_mask, teams } if (2..=MAXF as u8).contains(&factions) => {
+                (seed, factions as usize, ai_mask, teams)
+            }
             _ => return Err(std::io::Error::new(ErrorKind::InvalidData, "bad start")),
         };
         if my_faction >= factions {
@@ -510,7 +542,7 @@ impl Lockstep {
         for (f, slot) in is_ai.iter_mut().enumerate() {
             *slot = ai_mask & (1 << f) != 0;
         }
-        Ok(Lockstep::new(vec![Peer::new(stream, 0)], false, seed, factions, is_ai, my_faction))
+        Ok(Lockstep::new(vec![Peer::new(stream, 0)], false, seed, factions, is_ai, unpack_teams(teams), my_faction))
     }
 
     pub fn alive(&self) -> bool {
@@ -672,6 +704,9 @@ pub struct Host {
     pub port: u16,
     seed: u64,
     pub factions: usize,
+    /// Alliance id per faction — the host picks the mode in the lobby
+    /// ([0,1,2,3] FFA, [0,0,1,1] 2v2) and broadcasts it in Start.
+    pub teams: [u8; MAXF],
     peers: Vec<Peer>, // each carries the faction it was welcomed with
 }
 
@@ -683,7 +718,15 @@ impl Host {
             s.set_nonblocking(true).ok()?;
             Some(s)
         });
-        Ok(Host { listener, beacon, port, seed, factions: factions.clamp(2, MAXF), peers: Vec::new() })
+        Ok(Host {
+            listener,
+            beacon,
+            port,
+            seed,
+            factions: factions.clamp(2, MAXF),
+            teams: unpack_teams(TEAMS_FFA),
+            peers: Vec::new(),
+        })
     }
 
     /// Answer discovery pings and accept any waiting joiner (up to the player
@@ -740,11 +783,16 @@ impl Host {
             *slot = f != 0 && self.peers.iter().all(|p| p.faction != f);
         }
         let ai_mask = (0..MAXF).fold(0u8, |m, f| if is_ai[f] { m | (1 << f) } else { m });
-        let start = Msg::Start { seed: self.seed, factions: self.factions as u8, ai_mask };
+        let start = Msg::Start {
+            seed: self.seed,
+            factions: self.factions as u8,
+            ai_mask,
+            teams: pack_teams(&self.teams),
+        };
         for p in &mut self.peers {
             p.send(&start);
         }
-        Lockstep::new(self.peers, true, self.seed, self.factions, is_ai, 0)
+        Lockstep::new(self.peers, true, self.seed, self.factions, is_ai, self.teams, 0)
     }
 }
 
@@ -782,11 +830,13 @@ impl Joiner {
         let mut backlog = Vec::new();
         for m in msgs {
             match m {
-                Msg::Start { seed, factions, ai_mask } if cfg.is_none() => cfg = Some((seed, factions, ai_mask)),
+                Msg::Start { seed, factions, ai_mask, teams } if cfg.is_none() => {
+                    cfg = Some((seed, factions, ai_mask, teams))
+                }
                 other => backlog.push(other),
             }
         }
-        let (seed, factions, ai_mask) = cfg?;
+        let (seed, factions, ai_mask, teams) = cfg?;
         let factions = factions as usize;
         // A Start describing an impossible match would blow past the
         // fixed-size faction tables later; treat it as a protocol violation
@@ -802,7 +852,7 @@ impl Joiner {
         for (f, slot) in is_ai.iter_mut().enumerate() {
             *slot = ai_mask & (1 << f) != 0;
         }
-        let mut ls = Lockstep::new(vec![peer], false, seed, factions, is_ai, self.my_faction);
+        let mut ls = Lockstep::new(vec![peer], false, seed, factions, is_ai, unpack_teams(teams), self.my_faction);
         for m in backlog {
             ls.ingest(0, m);
         }
@@ -975,7 +1025,7 @@ mod tests {
         let (mut s, _) = listener.accept().unwrap();
         send_framed(&mut s, &Msg::Welcome { faction: 1 }).unwrap();
         let mut j = t.join().unwrap().unwrap();
-        send_framed(&mut s, &Msg::Start { seed: 1, factions: (MAXF + 1) as u8, ai_mask: 0 }).unwrap();
+        send_framed(&mut s, &Msg::Start { seed: 1, factions: (MAXF + 1) as u8, ai_mask: 0, teams: TEAMS_FFA }).unwrap();
         for _ in 0..4000 {
             assert!(j.poll_start().is_none(), "bogus start accepted");
             if !j.alive() {
@@ -1005,6 +1055,14 @@ mod tests {
     }
 
     #[test]
+    fn team_bytes_roundtrip() {
+        for teams in [[0u8, 1, 2, 3], [0, 0, 1, 1], [0, 1, 0, 1], [2, 2, 2, 2]] {
+            assert_eq!(unpack_teams(pack_teams(&teams)), teams);
+        }
+        assert_eq!(unpack_teams(TEAMS_FFA), [0, 1, 2, 3], "the FFA byte is everyone-for-themselves");
+    }
+
+    #[test]
     fn surrender_roundtrips_on_the_wire() {
         let mut b = Buf::default();
         enc_cmd(&mut b, &Cmd::Surrender);
@@ -1028,7 +1086,7 @@ mod tests {
         // 3 humans: faction 2's mismatching hash must flag a desync even when
         // faction 1's matching hash arrives afterwards (step-keyed storage
         // used to let the later Check overwrite the earlier one).
-        let mut ls = Lockstep::new(Vec::new(), false, 1, 3, [false; MAXF], 0);
+        let mut ls = Lockstep::new(Vec::new(), false, 1, 3, [false; MAXF], unpack_teams(TEAMS_FFA), 0);
         ls.advanced(0xABCD); // sim_step 0 records a local check
         ls.ingest(0, Msg::Check { faction: 2, step: 0, hash: 0xBEEF });
         ls.ingest(0, Msg::Check { faction: 1, step: 0, hash: 0xABCD });
@@ -1042,7 +1100,7 @@ mod tests {
 
     #[test]
     fn last_synced_needs_every_faction() {
-        let mut ls = Lockstep::new(Vec::new(), false, 1, 3, [false; MAXF], 0);
+        let mut ls = Lockstep::new(Vec::new(), false, 1, 3, [false; MAXF], unpack_teams(TEAMS_FFA), 0);
         while ls.sim_step <= CHECK_EVERY {
             ls.advanced(0xABCD); // local checks land at steps 0 and CHECK_EVERY
         }
@@ -1065,7 +1123,7 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let (server, _) = listener.accept().unwrap();
         server.set_nonblocking(true).unwrap();
-        let mut ls = Lockstep::new(vec![Peer::new(server, 1)], true, 1, 2, [false; MAXF], 0);
+        let mut ls = Lockstep::new(vec![Peer::new(server, 1)], true, 1, 2, [false; MAXF], unpack_teams(TEAMS_FFA), 0);
 
         // The link plays faction 1: a Step claiming faction 0 is spoofed, and
         // a step number far past the lockstep window is garbage.

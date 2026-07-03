@@ -9,9 +9,10 @@ Simple, yet surprisingly fun.
 ## The game
 
 Mine minerals, tech up, raise a combined-arms army, and be the **last base
-standing**. Play 1v1 or a **2–4 faction free-for-all**: solo against up to 3 AI,
-or online with up to 4 humans on separate machines (empty slots fill with AI).
-Maps grow with the player count.
+standing**. Play 1v1, a **2–4 faction free-for-all**, or a **2v2 team battle**:
+solo against up to 3 AI (with or without an AI ally), or online with up to 4
+humans on separate machines (empty slots fill with AI). Maps grow with the
+player count.
 
 **Economy**
 - **Workers** mine cyan mineral patches and haul them home (auto-assigned to the
@@ -38,9 +39,17 @@ clear job, so the counters matter:
   splash shells over your front line to break turtles and level buildings. But
   they have a point-blank **dead zone** — get on top of one and it's helpless.
 
+**Defense**
+- **Turrets** (worker-built, needs a Barracks) — static guns that auto-fire at
+  anything hostile in range. One holds a mineral line against raiders and worker
+  rushes, and workers can repair it under fire — but it's fixed in place, and a
+  Mortar outranges it and calmly shells it apart. The AI builds them too (except
+  all-in rushers), so bring siege.
+
 Clump up and a Pyro, Tank, or Sapper punishes you; spread out and you give
-Raiders room to pick you apart; turtle up and a Mortar shells you out. Mix your
-army to cover its weaknesses — and screen your Mortars so nothing reaches them.
+Raiders room to pick you apart; turtle up behind Turrets and a Mortar shells you
+out. Mix your army to cover its weaknesses — and screen your Mortars so nothing
+reaches them.
 
 **The map** is generated fresh every match (from the seed, so both peers in
 multiplayer get the identical board):
@@ -74,6 +83,13 @@ over while another building still stands — fight on and rebuild. But once your
 last building falls you're out, so the endgame never drags into a hunt for one
 fleeing unit.
 
+**Team games (2v2).** Pick **2V2** in the skirmish menu (you + an AI ally vs
+two AI) or toggle **MODE: 2V2** in the multiplayer host lobby (slots 1+2 vs
+3+4). Allies never target each other, **share vision**, and win or lose as a
+side. Your workers can **repair an ally's buildings**, an allied AI marches to
+defend your bases, and if you're wiped out while your partner still stands you
+spectate on — the match runs until one side remains.
+
 ## Controls
 
 | Input | Action |
@@ -90,6 +106,7 @@ fleeing unit.
 | `E` / `Y` / `G` | Train a Soldier / Pyro / Sapper (Barracks selected) |
 | `T` / `R` / `V` | Train a Tank / Raider / Mortar (Factory selected) |
 | `B` / `F` / `D` / `C` | Build Barracks / Factory / Depot / Command Center (worker selected, then click — **Shift-click to chain several**) |
+| `T` | Build a Turret (worker selected — the same key trains a Tank when a Factory is selected instead) |
 | `A` | Attack-move (then left-click a destination) |
 | `S` | Stop |
 | Arrow keys / screen edges | Scroll the map |
@@ -115,8 +132,8 @@ simulated identically on every machine. A periodic state checksum is swapped
 each way; if any two ever disagree, the HUD raises a **desync** alarm.
 
 Just launch the game and use the **main menu**: **Host Game** opens a lobby
-(pick your player count; empty slots become AI), beacons on the LAN, and lists
-the players as they join. **Join Game** shows every host it finds on the network
+(pick your player count and toggle **free-for-all / 2v2**; empty slots become
+AI), beacons on the LAN, and lists the players as they join. **Join Game** shows every host it finds on the network
 as a one-click button (or type an `IP:PORT` to dial across subnets) — you get a
 faction colour and wait for the host to hit **Start**. The host appears
 instantly via UDP discovery, so the joiner usually doesn't type anything.
