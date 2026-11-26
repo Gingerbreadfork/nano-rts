@@ -22,6 +22,10 @@ pub const DISCO_PORT: u16 = 50321;
 const PING_MAGIC: &[u8] = b"NANORTS-WHERE?";
 const PONG_MAGIC: &[u8] = b"NANORTS-HERE!"; // followed by 2-byte LE tcp port
 
+/// Sent in Welcome so peers on different builds refuse to pair. Bump whenever
+/// the wire format or the sim's rules change, since either one desyncs a match.
+const NET_VERSION: u8 = 1;
+
 // ---- tiny byte writer/reader ----------------------------------------------
 
 // Crate-visible because the replay recorder reuses this codec, so a replay
@@ -186,7 +190,7 @@ pub(crate) fn dec_cmd(r: &mut Rdr) -> Option<Cmd> {
 enum Msg {
     Step { faction: u8, step: u32, cmds: Vec<Cmd> },
     Check { faction: u8, step: u32, hash: u64 },
-    Welcome { faction: u8 },                                   // host -> joiner on accept
+    Welcome { faction: u8, version: u8 },                      // host -> joiner on accept
     Start { seed: u64, factions: u8, ai_mask: u8, teams: u8 }, // host -> joiner to begin
 }
 
@@ -223,9 +227,10 @@ fn enc_msg(m: &Msg) -> Vec<u8> {
             b.u32(*step);
             b.u64(*hash);
         }
-        Msg::Welcome { faction } => {
-            b.u8(3);
+        Msg::Welcome { faction, version } => {
+            b.u8(5);
             b.u8(*faction);
+            b.u8(*version);
         }
         Msg::Start { seed, factions, ai_mask, teams } => {
             b.u8(4);
@@ -255,13 +260,15 @@ fn dec_msg(bytes: &[u8]) -> Option<Msg> {
             step: r.u32()?,
             hash: r.u64()?,
         },
-        3 => Msg::Welcome { faction: r.u8()? },
+        // A Welcome from a build without version numbers reads as version 0.
+        3 => Msg::Welcome { faction: r.u8()?, version: 0 },
         4 => Msg::Start {
             seed: r.u64()?,
             factions: r.u8()?,
             ai_mask: r.u8()?,
             teams: r.u8()?,
         },
+        5 => Msg::Welcome { faction: r.u8()?, version: r.u8()? },
         _ => return None,
     })
 }
@@ -425,6 +432,17 @@ fn read_framed(stream: &mut TcpStream) -> std::io::Result<Msg> {
     stream.read_exact(&mut buf)?;
     dec_msg(&buf).ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "bad handshake message"))
 }
+/// Read the host's Welcome and return our faction. Only 1..MAXF are joinable
+/// slots, and a host on another version would desync, so both are refused.
+fn read_welcome(stream: &mut TcpStream) -> std::io::Result<usize> {
+    match read_framed(stream)? {
+        Msg::Welcome { version, .. } if version != NET_VERSION => {
+            Err(std::io::Error::new(ErrorKind::InvalidData, "host runs a different game version"))
+        }
+        Msg::Welcome { faction, .. } if (1..MAXF as u8).contains(&faction) => Ok(faction as usize),
+        _ => Err(std::io::Error::new(ErrorKind::InvalidData, "bad welcome")),
+    }
+}
 fn connect_to(addr: &str) -> std::io::Result<TcpStream> {
     let budget = Duration::from_secs(6);
     let stream = match addr.parse() {
@@ -517,7 +535,7 @@ impl Lockstep {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         let (mut stream, _addr) = listener.accept()?;
         stream.set_nodelay(true).ok();
-        send_framed(&mut stream, &Msg::Welcome { faction: 1 })?;
+        send_framed(&mut stream, &Msg::Welcome { faction: 1, version: NET_VERSION })?;
         send_framed(&mut stream, &Msg::Start { seed, factions: 2, ai_mask: 0, teams: TEAMS_FFA })?;
         stream.set_nonblocking(true)?;
         Ok(Lockstep::new(vec![Peer::new(stream, 1)], true, seed, 2, [false; MAXF], unpack_teams(TEAMS_FFA), 0))
@@ -529,10 +547,7 @@ impl Lockstep {
         stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
         // The handshake values index fixed-size faction tables everywhere
         // downstream, so anything out of range is a protocol error here.
-        let my_faction = match read_framed(&mut stream)? {
-            Msg::Welcome { faction } if (1..MAXF as u8).contains(&faction) => faction as usize,
-            _ => return Err(std::io::Error::new(ErrorKind::InvalidData, "bad welcome")),
-        };
+        let my_faction = read_welcome(&mut stream)?;
         let (seed, factions, ai_mask, teams) = match read_framed(&mut stream)? {
             Msg::Start { seed, factions, ai_mask, teams } if (2..=MAXF as u8).contains(&factions) => {
                 (seed, factions as usize, ai_mask, teams)
@@ -762,7 +777,8 @@ impl Host {
         if let Some(faction) = free {
             if let Ok((mut stream, _addr)) = self.listener.accept() {
                 stream.set_nodelay(true).ok();
-                if send_framed(&mut stream, &Msg::Welcome { faction: faction as u8 }).is_ok() && stream.set_nonblocking(true).is_ok() {
+                let welcome = Msg::Welcome { faction: faction as u8, version: NET_VERSION };
+                if send_framed(&mut stream, &welcome).is_ok() && stream.set_nonblocking(true).is_ok() {
                     self.peers.push(Peer::new(stream, faction));
                 }
             }
@@ -814,12 +830,7 @@ impl Joiner {
     pub fn connect(addr: &str) -> std::io::Result<Joiner> {
         let mut stream = connect_to(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
-        // Only 1..MAXF are joinable slots (0 is the host); anything else would
-        // index out of the fixed-size faction tables, so refuse the handshake.
-        let my_faction = match read_framed(&mut stream)? {
-            Msg::Welcome { faction } if (1..MAXF as u8).contains(&faction) => faction as usize,
-            _ => return Err(std::io::Error::new(ErrorKind::InvalidData, "bad welcome")),
-        };
+        let my_faction = read_welcome(&mut stream)?;
         stream.set_read_timeout(None).ok();
         stream.set_nonblocking(true)?;
         Ok(Joiner { peer: Some(Peer::new(stream, 0)), my_faction })
@@ -1021,14 +1032,28 @@ mod tests {
         // A Welcome carrying an impossible faction must fail the connect.
         let t = connect_bg(format!("127.0.0.1:{port}"));
         let (mut s, _) = listener.accept().unwrap();
-        send_framed(&mut s, &Msg::Welcome { faction: MAXF as u8 }).unwrap();
+        send_framed(&mut s, &Msg::Welcome { faction: MAXF as u8, version: NET_VERSION }).unwrap();
+        assert!(t.join().unwrap().is_err());
+
+        // So must a Welcome from a host on another version.
+        let t = connect_bg(format!("127.0.0.1:{port}"));
+        let (mut s, _) = listener.accept().unwrap();
+        send_framed(&mut s, &Msg::Welcome { faction: 1, version: NET_VERSION + 1 }).unwrap();
+        assert!(t.join().unwrap().is_err());
+
+        // And the unversioned Welcome, which decodes as version 0.
+        let t = connect_bg(format!("127.0.0.1:{port}"));
+        let (mut s, _) = listener.accept().unwrap();
+        let legacy = [3u8, 1];
+        s.write_all(&(legacy.len() as u32).to_le_bytes()).unwrap();
+        s.write_all(&legacy).unwrap();
         assert!(t.join().unwrap().is_err());
 
         // A Start with an absurd faction count must kill the lobby link, not
         // hand back a Lockstep that would index out of the faction tables.
         let t = connect_bg(format!("127.0.0.1:{port}"));
         let (mut s, _) = listener.accept().unwrap();
-        send_framed(&mut s, &Msg::Welcome { faction: 1 }).unwrap();
+        send_framed(&mut s, &Msg::Welcome { faction: 1, version: NET_VERSION }).unwrap();
         let mut j = t.join().unwrap().unwrap();
         send_framed(&mut s, &Msg::Start { seed: 1, factions: (MAXF + 1) as u8, ai_mask: 0, teams: TEAMS_FFA }).unwrap();
         for _ in 0..4000 {

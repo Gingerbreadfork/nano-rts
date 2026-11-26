@@ -665,6 +665,28 @@ fn run_replay_list(
     }
 }
 
+/// Hold a failed host or join attempt on screen until the player dismisses it.
+fn show_lobby_error(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, x_map: &mut Vec<u32>, windowed: bool, big: &str, reason: &str) {
+    let accent = rgb(235, 120, 110);
+    let mut t = 0u64;
+    let mut last_left = window.get_mouse_down(MouseButton::Left);
+    while window.is_open() {
+        sync_canvas(window, screen, canvas, x_map);
+        let left = window.get_mouse_down(MouseButton::Left);
+        if (left && !last_left) || window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+            return;
+        }
+        last_left = left;
+        draw_lobby(canvas, t, "MULTIPLAYER", big, "", "Esc to go back", accent);
+        canvas.text_center(canvas.w / 2, canvas.h / 2 - 56, reason, gfx::mix(accent, rgb(230, 240, 240), 0.5), 2);
+        present_frame(window, screen, canvas, x_map);
+        if !windowed {
+            fullscreen_tick(t);
+        }
+        t += 1;
+    }
+}
+
 /// The join screen: live LAN host discovery (clickable) plus a typed-address
 /// field. Returns Join(addr), Menu (back), or Quit.
 fn run_join_browse(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, x_map: &mut Vec<u32>, windowed: bool) -> AppNext {
@@ -773,6 +795,7 @@ fn run_host_lobby(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas,
         Ok(h) => h,
         Err(e) => {
             eprintln!("could not host on port {port}: {e}");
+            show_lobby_error(window, screen, canvas, x_map, windowed, "COULD NOT HOST", &e.to_string());
             return None;
         }
     };
@@ -887,6 +910,7 @@ fn run_join_connect(window: &mut Window, screen: &mut Canvas, canvas: &mut Canva
         Ok(j) => j,
         Err(e) => {
             eprintln!("could not join {target}: {e}");
+            show_lobby_error(window, screen, canvas, x_map, windowed, "COULD NOT JOIN", &e.to_string());
             return None;
         }
     };
