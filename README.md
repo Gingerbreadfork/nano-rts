@@ -178,9 +178,15 @@ host is always blue).
 
 ## Build & run
 
+Prebuilt **Linux** binaries (x86_64 and arm64) are attached to each
+[release](https://github.com/Gingerbreadfork/nano-rts/releases): unpack the
+tarball and run `./nanorts`. To build from source:
+
 ```sh
 cargo run --release
 ```
+
+On Debian/Ubuntu the build needs `libasound2-dev`.
 
 The game opens to a menu: **Single Player**, **Watch AI Battle**, **Replays**,
 **Host Game**, **Join Game**, **Quit** — navigate by mouse or the number keys.
