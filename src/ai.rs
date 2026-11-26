@@ -815,21 +815,13 @@ fn pending(w: &World, kind: Kind, me: Team) -> bool {
 }
 
 fn free_site(w: &World, near: V2, kind: Kind, me: Team) -> Option<V2> {
-    // The 8 ring directions (k/8 * TAU) as literal (cos, sin) pairs. Building
-    // positions are simulation state (checksummed in lockstep), and libm's f32
-    // cos/sin is not bit-identical across platforms — a const table is.
-    const RING: [(f32, f32); 8] = [
-        (1.0, 0.0),
-        (0.70710678, 0.70710678),
-        (0.0, 1.0),
-        (-0.70710678, 0.70710678),
-        (-1.0, 0.0),
-        (-0.70710678, -0.70710678),
-        (0.0, -1.0),
-        (0.70710678, -0.70710678),
-    ];
-    // The team-scoped check: placement is sim state, so it must see exactly
-    // this faction's pending sites — never my_team's, never a rival's.
+    // The 8 ring directions as constant cos and sin pairs. Building positions
+    // are checksummed sim state and libm's f32 trig is not bit-identical
+    // across platforms, so nothing here is computed at run time.
+    const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const RING: [(f32, f32); 8] = [(1.0, 0.0), (D, D), (0.0, 1.0), (-D, D), (-1.0, 0.0), (-D, -D), (0.0, -1.0), (D, -D)];
+    // Placement is sim state, so the check must see only this faction's
+    // pending sites.
     if w.can_build_team(me, kind, near) {
         return Some(near);
     }

@@ -3185,7 +3185,7 @@ fn draw_dust(c: &mut Canvas, w: &World, camx: i32, camy: i32) {
         if sx < 0 || sy < 0 || sx >= c.w || sy >= c.h {
             continue;
         }
-        let tw = (t * (0.6 + hp * 1.4) + hp * 6.28).sin() * 0.5 + 0.5;
+        let tw = (t * (0.6 + hp * 1.4) + hp * std::f32::consts::TAU).sin() * 0.5 + 0.5;
         c.add_px(sx, sy, rgb(170, 195, 185), 0.05 + 0.11 * tw);
     }
 }
