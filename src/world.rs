@@ -254,9 +254,25 @@ impl AiState {
     }
 }
 
+/// One faction's economy/army reading, sampled once a second into
+/// `World::stats` for the end-of-match graphs. Derived purely from sim state,
+/// so a replay recomputes the identical series.
+#[derive(Clone, Copy, Default)]
+pub struct FacStat {
+    pub army: u32,  // total mineral cost of the faction's living army units
+    pub mined: u32, // cumulative minerals hauled home so far
+}
+
 pub struct World {
     pub ents: Vec<Ent>,
     next_id: u32,
+    /// The raw seed this match was built from, kept for replay recording.
+    /// The working RNG is a mixed copy.
+    pub seed: u64,
+    /// The sim's step clock: the count of `update` calls since the match
+    /// began. Recorded commands are stamped with it so a replay re-applies
+    /// each one on the same step. Never checksummed, never a sim input.
+    pub step: u32,
     /// Minerals per faction, indexed by `Team::idx()`.
     pub minerals: [u32; MAX_FACTIONS],
     /// Number of active factions (2..=4).
@@ -328,6 +344,20 @@ pub struct World {
     /// left). Drawn as pulsing alarm rings on the minimap. Per-viewer display
     /// state like `kills` — never checksummed, never a sim input.
     pub attack_pings: Vec<(V2, f32)>,
+    /// Where the most recent under-attack alarm rang, kept after the ring
+    /// fades so Space can always jump the camera back to the last trouble
+    /// spot. Per-viewer display state, never a sim input.
+    pub last_alert: Option<V2>,
+    /// Full-map vision for the renderer: `vis_at` reports everything visible.
+    /// Observer display state only. The sim asks `team_vis_at`, so flipping
+    /// this never changes the simulation.
+    pub reveal: bool,
+    /// Cumulative minerals each faction has hauled home. Refunds do not
+    /// count. Deterministic sim output feeding the end-of-match graphs.
+    pub mined: [u32; MAX_FACTIONS],
+    /// Once-a-second per-faction readings for the end-of-match graphs.
+    pub stats: Vec<[FacStat; MAX_FACTIONS]>,
+    stat_timer: f32,
     /// Fixed per-match wind heading for cosmetic drift (dust motes). Derived
     /// from the seed so every peer sees the same sky; never checksummed and
     /// never read by the sim, so platform trig differences are harmless.
@@ -664,6 +694,8 @@ impl World {
         let mut w = World {
             ents: Vec::new(),
             next_id: 1,
+            seed,
+            step: 0,
             minerals: [50; MAX_FACTIONS],
             factions,
             is_ai,
@@ -705,6 +737,11 @@ impl World {
             kills: 0,
             seen_buildings: Vec::new(),
             attack_pings: Vec::new(),
+            last_alert: None,
+            reveal: false,
+            mined: [0; MAX_FACTIONS],
+            stats: Vec::new(),
+            stat_timer: 0.0,
             wind: v2(wind_ang.cos(), wind_ang.sin()),
         };
         w.setup();
@@ -1649,7 +1686,7 @@ impl World {
 
         if mine && sel.iter().any(|&i| is_mover(self.ents[i].kind)) {
             let (pt, col) = match tinfo {
-                Some((_, t, _)) if self.hostile(team, t) => {
+                Some((_, t, _)) if self.hostile(team, t) && !attack_move => {
                     (self.ents[target.unwrap()].pos, crate::gfx::rgb(240, 90, 80))
                 }
                 Some((_, _, Kind::Mineral)) => {
@@ -1682,9 +1719,10 @@ impl World {
                 }
                 continue;
             }
-            // Decide the order this unit should carry out.
+            // Decide the order this unit should carry out. An attack-move
+            // sweeps toward the point and never locks onto the entity under it.
             let new_order = match tinfo {
-                Some((tid, tteam, _)) if self.hostile(team, tteam) => Order::Attack(tid),
+                Some((tid, tteam, _)) if self.hostile(team, tteam) && !attack_move => Order::Attack(tid),
                 Some((tid, _, Kind::Mineral)) if kind == Kind::Worker => Order::Gather(tid),
                 _ if kind == Kind::Worker && repair_id.is_some() => Order::Repair(repair_id.unwrap()),
                 _ => {
@@ -2522,8 +2560,12 @@ impl World {
     }
 
     /// Visibility at a world point for the LOCAL player: 0 unseen, 1 explored,
-    /// 2 visible. (Renderer and player-facing queries use this.)
+    /// 2 visible. For the renderer and player-facing queries only: it honours
+    /// the observer `reveal` flag, so the sim must ask `team_vis_at` instead.
     pub fn vis_at(&self, p: V2) -> u8 {
+        if self.reveal {
+            return 2;
+        }
         self.team_vis_at(self.my_team, p)
     }
 
@@ -2550,6 +2592,9 @@ impl World {
     // ---- the main tick ----------------------------------------------------
 
     pub fn update(&mut self, dt: f32) {
+        // The step clock counts every call, frozen post-match ticks included,
+        // so replayed commands stay aligned with the recording.
+        self.step = self.step.wrapping_add(1);
         if self.match_over {
             // Match decided: let tracers/particles/messages finish, units idle.
             // (Frozen identically on every peer, so checksums stay matched.)
@@ -2559,6 +2604,22 @@ impl World {
         }
         self.time += dt;
         self.attack_warn -= dt;
+        // Sample the per-faction graphs once a second while the match runs.
+        self.stat_timer -= dt;
+        if self.stat_timer <= 0.0 {
+            self.stat_timer += 1.0;
+            let mut row = [FacStat::default(); MAX_FACTIONS];
+            for e in &self.ents {
+                let fi = e.team.idx();
+                if fi < self.factions && is_army(e.kind) {
+                    row[fi].army += cost(e.kind);
+                }
+            }
+            for (fi, s) in row.iter_mut().enumerate().take(self.factions) {
+                s.mined = self.mined[fi];
+            }
+            self.stats.push(row);
+        }
 
         // Run each AI-controlled faction's brain (deterministic on every peer).
         // Rotate the order each tick so no faction — in particular the human's
@@ -2598,14 +2659,16 @@ impl World {
             })
             .map(|e| (e.pos, e.kind, e.team))
             .collect();
-        // Split the memory out so we can consult vis_at while editing it.
+        // Split the memory out so we can consult the fog while editing it. Ask
+        // for the viewer's own sight: an observer's `reveal` must not feed it.
+        let me = self.my_team;
         let mut seen = std::mem::take(&mut self.seen_buildings);
         seen.retain(|&(p, k, t)| {
-            self.vis_at(p) != 2
+            self.team_vis_at(me, p) != 2
                 || standing.iter().any(|&(q, qk, qt)| qk == k && qt == t && q.dist_sq(p) < NEAR2)
         });
         for &(p, k, t) in &standing {
-            if self.vis_at(p) == 2 && !seen.iter().any(|&(q, _, _)| q.dist_sq(p) < NEAR2) {
+            if self.team_vis_at(me, p) == 2 && !seen.iter().any(|&(q, _, _)| q.dist_sq(p) < NEAR2) {
                 seen.push((p, k, t));
             }
         }
@@ -3059,6 +3122,9 @@ impl World {
             let bpos = self.ents[bi].pos;
             if pos.dist(bpos) <= radius(Kind::Worker) + radius(Kind::Base) + 6.0 {
                 self.gain(team, self.ents[i].carry);
+                if team.idx() < MAX_FACTIONS {
+                    self.mined[team.idx()] += self.ents[i].carry;
+                }
                 self.ents[i].carry = 0;
                 self.ents[i].goal = None;
             } else {
@@ -3094,6 +3160,7 @@ impl World {
                 // already covering it so a running battle is one alarm, not a
                 // stack. Per-viewer display state — never a sim input.
                 const NEAR2: f32 = 320.0 * 320.0;
+                self.last_alert = Some(pos);
                 match self.attack_pings.iter_mut().find(|a| a.0.dist_sq(pos) < NEAR2) {
                     Some(a) => {
                         a.0 = pos;
@@ -3316,6 +3383,55 @@ mod tests {
             .iter()
             .position(|e| e.team == Team::Player && e.kind == Kind::Worker)
             .expect("player should start with workers")
+    }
+
+    /// An attack-move whose click lands exactly on an enemy must stay an
+    /// attack-move, not lock onto that one entity.
+    #[test]
+    fn attack_move_never_locks_onto_a_target() {
+        let mut w = World::new(2);
+        let s = w.spawn(Kind::Soldier, Team::Player, v2(500.0, 1000.0));
+        let e = w.spawn(Kind::Soldier, Team::Enemy, v2(1200.0, 1000.0));
+        let ep = w.ents[e].pos;
+        let ids = vec![w.ents[s].id];
+        w.apply_cmd(Team::Player, &Cmd::Order { ids, x: ep.x, y: ep.y, attack_move: true, queue: false });
+        assert!(
+            matches!(w.ents[s].order, Order::AttackMove(_)),
+            "A-click on an enemy must sweep, not chase one target"
+        );
+        // Right-click on the same enemy IS the focus-fire gesture: it locks.
+        let ids = vec![w.ents[s].id];
+        w.apply_cmd(Team::Player, &Cmd::Order { ids, x: ep.x, y: ep.y, attack_move: false, queue: false });
+        assert!(matches!(w.ents[s].order, Order::Attack(id) if id == w.ents[e].id));
+    }
+
+    /// The point of attack-move: enemies encountered along the way get fought,
+    /// not walked past.
+    #[test]
+    fn attack_move_engages_enemies_on_the_way() {
+        let mut w = World::new(2);
+        let s = w.spawn(Kind::Soldier, Team::Player, v2(500.0, 1000.0));
+        let e = w.spawn(Kind::Soldier, Team::Enemy, v2(750.0, 1000.0));
+        let eid = w.ents[e].id;
+        let ids = vec![w.ents[s].id];
+        // Destination far beyond the enemy: it sits on the path, not at the end.
+        w.apply_cmd(Team::Player, &Cmd::Order { ids, x: 1600.0, y: 1000.0, attack_move: true, queue: false });
+        let mut engaged = false;
+        for _ in 0..60 * 8 {
+            w.update(1.0 / 60.0);
+            match w.index_of(eid) {
+                None => {
+                    engaged = true; // shot down outright
+                    break;
+                }
+                Some(ei) if w.ents[ei].hp < max_hp(Kind::Soldier) => {
+                    engaged = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(engaged, "an attack-moving unit walked straight past an enemy");
     }
 
     #[test]
@@ -4422,6 +4538,16 @@ mod tests {
             !w.seen_buildings.iter().any(|&(p, _, _)| p.dist(epos) < 4.0),
             "a razed building in full view must be forgotten"
         );
+    }
+
+    /// The fog memory tracks what the viewer's faction saw, even while an
+    /// observer has the whole map revealed.
+    #[test]
+    fn reveal_does_not_feed_the_fog_memory() {
+        let mut w = duel_sandbox(2);
+        w.reveal = true;
+        w.update(1.0 / 60.0);
+        assert!(w.seen_buildings.is_empty(), "the enemy base is still under the viewer's fog");
     }
 
     #[test]

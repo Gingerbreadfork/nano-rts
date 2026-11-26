@@ -12,11 +12,13 @@
 //!   Arrows / edges scroll            Minimap       click to jump
 //!   Esc            cancel / deselect R             restart (when game over)
 //!
-//! The game opens to a main menu (Single Player / Host / Join / Quit); pause and
-//! the end screen route back to it. Matches are 2–4 faction free-for-alls: solo
-//! vs up to 3 AI, or up to 4 humans online. Multiplayer is serverless
-//! deterministic lockstep — no server, the host relays commands in a star, AI
-//! factions are simulated locally — set up from the menu, or via CLI shortcuts:
+//! The game opens to a main menu: Single Player, Watch AI Battle, Replays,
+//! Host, Join, Quit. Pause and the end screen route back to it. Matches are
+//! 2–4 faction free-for-alls: solo vs up to 3 AI, or up to 4 humans online.
+//! Finished matches auto-save to replays/ as a seed plus command stream, and
+//! playback re-runs the deterministic sim. Multiplayer is serverless
+//! deterministic lockstep: the host relays commands in a star and AI factions
+//! are simulated locally. Set it up from the menu, or via CLI shortcuts:
 //!   nanorts --host [port]   host a match + beacon on the LAN  (default :7777)
 //!   nanorts --join          auto-discover and join a LAN host
 //!   nanorts --join <addr>   join a specific host, e.g. 192.168.0.10:7777
@@ -26,6 +28,7 @@ mod audio;
 mod font;
 mod gfx;
 mod net;
+mod replay;
 mod vec;
 mod world;
 
@@ -188,6 +191,10 @@ struct Ui {
     attack_pending: bool,
     show_help: bool,
     menu: bool, // pause menu (resume / surrender / quit)
+    /// Observer view, for replay playback and AI exhibitions. The world and
+    /// minimap render as usual, but the observer loop draws its own HUD and
+    /// overlays in place of the player HUD and game-over screen.
+    observer: bool,
 }
 
 fn seed() -> u64 {
@@ -296,6 +303,11 @@ enum AppNext {
     /// A skirmish: this many factions (1 human + AI) with these alliance ids
     /// ([0,1,2,3] = free-for-all, [0,1,0,1] = 2v2 with the green AI).
     Single(usize, [u8; world::MAX_FACTIONS]),
+    /// An AI exhibition: this many AI factions with these alliance ids,
+    /// watched from the observer view.
+    Spectate(usize, [u8; world::MAX_FACTIONS]),
+    /// Play back a saved replay file in the observer view.
+    Replay(std::path::PathBuf),
     Host(u16),
     Join(String),
     Quit,
@@ -401,10 +413,13 @@ fn normalize_addr(s: &str) -> String {
     }
 }
 
-/// The main menu: Single Player / Host / Join / Quit. Returns the chosen state.
+/// The main menu. Returns the chosen state.
 fn run_main_menu(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, x_map: &mut Vec<u32>, windowed: bool) -> AppNext {
     let mut t = 0u64;
     let mut last_left = window.get_mouse_down(MouseButton::Left);
+    // A key pressed on the screen we came from reads as pressed until the next
+    // present, so skip one read or its Esc would quit from here.
+    let mut stale_keys = true;
     let mut last_mouse = v2(canvas.w as f32 / 2.0, canvas.h as f32 / 2.0);
     let accent = rgb(90, 200, 255);
     loop {
@@ -422,10 +437,17 @@ fn run_main_menu(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, 
 
         draw_menu_bg(canvas, t, "NANORTS", "RTS IN A TEACUP", accent);
         let cx = canvas.w / 2;
-        let labels = ["SINGLE PLAYER", "HOST GAME (LAN)", "JOIN GAME (LAN)", "QUIT"];
-        let accents = [rgb(120, 230, 140), rgb(90, 200, 255), rgb(255, 200, 90), rgb(235, 120, 110)];
-        let (bw, bh, gap) = (380, 56, 18);
-        let y0 = canvas.h / 2 - 70;
+        let labels = ["SINGLE PLAYER", "WATCH AI BATTLE", "REPLAYS", "HOST GAME (LAN)", "JOIN GAME (LAN)", "QUIT"];
+        let accents = [
+            rgb(120, 230, 140),
+            rgb(190, 150, 255),
+            rgb(120, 210, 220),
+            rgb(90, 200, 255),
+            rgb(255, 200, 90),
+            rgb(235, 120, 110),
+        ];
+        let (bw, bh, gap) = (380, 50, 14);
+        let y0 = canvas.h / 2 - 160;
         let mut chosen: Option<usize> = None;
         for (i, lab) in labels.iter().enumerate() {
             let b = Btn::new(cx, y0 + i as i32 * (bh + gap), bw, bh, lab, accents[i]);
@@ -435,13 +457,17 @@ fn run_main_menu(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, 
                 chosen = Some(i);
             }
         }
-        canvas.text_center(cx, canvas.h - 54, "CLICK  OR  PRESS 1-4", rgb(120, 135, 140), 2);
-        for k in window.get_keys_pressed(KeyRepeat::No) {
+        canvas.text_center(cx, canvas.h - 54, "CLICK  OR  PRESS 1-6", rgb(120, 135, 140), 2);
+        let keys = if stale_keys { Vec::new() } else { window.get_keys_pressed(KeyRepeat::No) };
+        stale_keys = false;
+        for k in keys {
             match k {
                 Key::Key1 | Key::NumPad1 => chosen = Some(0),
                 Key::Key2 | Key::NumPad2 => chosen = Some(1),
                 Key::Key3 | Key::NumPad3 => chosen = Some(2),
-                Key::Key4 | Key::NumPad4 | Key::Escape | Key::Q => chosen = Some(3),
+                Key::Key4 | Key::NumPad4 => chosen = Some(3),
+                Key::Key5 | Key::NumPad5 => chosen = Some(4),
+                Key::Key6 | Key::NumPad6 | Key::Escape | Key::Q => chosen = Some(5),
                 _ => {}
             }
         }
@@ -449,29 +475,36 @@ fn run_main_menu(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, 
         if !windowed {
             fullscreen_tick(t);
         }
-        match chosen {
-            Some(0) => match run_skirmish_setup(window, screen, canvas, x_map, windowed) {
-                AppNext::Menu => last_left = true,
-                other => return other,
-            },
-            Some(1) => return AppNext::Host(MP_PORT),
-            Some(2) => match run_join_browse(window, screen, canvas, x_map, windowed) {
-                AppNext::Menu => last_left = true, // swallow the click, stay in the menu
-                other => return other,
-            },
-            Some(3) => return AppNext::Quit,
-            _ => {}
+        let sub = match chosen {
+            Some(0) => Some(run_skirmish_setup(window, screen, canvas, x_map, windowed, false)),
+            Some(1) => Some(run_skirmish_setup(window, screen, canvas, x_map, windowed, true)),
+            Some(2) => Some(run_replay_list(window, screen, canvas, x_map, windowed, None)),
+            Some(3) => return AppNext::Host(MP_PORT),
+            Some(4) => Some(run_join_browse(window, screen, canvas, x_map, windowed)),
+            Some(5) => return AppNext::Quit,
+            _ => None,
+        };
+        match sub {
+            // Back from a sub-screen: swallow its click and its key.
+            Some(AppNext::Menu) => {
+                last_left = true;
+                stale_keys = true;
+            }
+            Some(other) => return other,
+            None => {}
         }
         t += 1;
     }
 }
 
 /// Single-player skirmish setup: choose how many AI opponents to face.
-fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, x_map: &mut Vec<u32>, windowed: bool) -> AppNext {
+/// With `spectate` set it is the AI-exhibition picker instead: the same
+/// choices, but every faction is an AI and you watch from the observer view.
+fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Canvas, x_map: &mut Vec<u32>, windowed: bool, spectate: bool) -> AppNext {
     let mut t = 0u64;
     let mut last_left = window.get_mouse_down(MouseButton::Left);
     let mut last_mouse = v2(canvas.w as f32 / 2.0, canvas.h as f32 / 2.0);
-    let accent = rgb(120, 230, 140);
+    let accent = if spectate { rgb(190, 150, 255) } else { rgb(120, 230, 140) };
     loop {
         if !window.is_open() {
             return AppNext::Quit;
@@ -485,9 +518,17 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
         let click = left && !last_left;
         last_left = left;
 
-        draw_menu_bg(canvas, t, "SKIRMISH", "PICK YOUR BATTLE", accent);
+        if spectate {
+            draw_menu_bg(canvas, t, "EXHIBITION", "PICK A BATTLE TO WATCH", accent);
+        } else {
+            draw_menu_bg(canvas, t, "SKIRMISH", "PICK YOUR BATTLE", accent);
+        }
         let cx = canvas.w / 2;
-        let labels = ["1 AI  (DUEL)", "2 AI  (3-WAY FFA)", "3 AI  (4-WAY FFA)", "2V2  (AI ALLY VS 2 AI)"];
+        let labels = if spectate {
+            ["2 AI  (DUEL)", "3 AI  (3-WAY FFA)", "4 AI  (4-WAY FFA)", "2V2  (TWO AI TEAMS)"]
+        } else {
+            ["1 AI  (DUEL)", "2 AI  (3-WAY FFA)", "3 AI  (4-WAY FFA)", "2V2  (AI ALLY VS 2 AI)"]
+        };
         // 420 wide so the longest label ("2V2 ...", 396px at scale 3) stays inside the button.
         let (bw, bh, gap) = (420, 56, 18);
         let y0 = canvas.h / 2 - 110;
@@ -521,11 +562,104 @@ fn run_skirmish_setup(window: &mut Window, screen: &mut Canvas, canvas: &mut Can
             fullscreen_tick(t);
         }
         match chosen {
-            // Free-for-all: factions = opponents + 1 human, everyone for themselves.
+            // Free-for-all, everyone for themselves. Spectating fields all AI;
+            // otherwise faction 0 is the human.
+            Some(i @ 0..=2) if spectate => return AppNext::Spectate(i + 2, [0, 1, 2, 3]),
             Some(i @ 0..=2) => return AppNext::Single(i + 2, [0, 1, 2, 3]),
-            // 2v2: you + the green AI against the red + amber AIs.
+            // 2v2: two sides of two factions each.
+            Some(3) if spectate => return AppNext::Spectate(4, [0, 1, 0, 1]),
+            // You + the green AI against the red + amber AIs.
             Some(3) => return AppNext::Single(4, [0, 1, 0, 1]),
             _ => {}
+        }
+        t += 1;
+    }
+}
+
+/// The replay browser: saved matches newest first, a page at a time, click to
+/// watch. `notice` is shown above the list, for a replay that failed to load.
+fn run_replay_list(
+    window: &mut Window,
+    screen: &mut Canvas,
+    canvas: &mut Canvas,
+    x_map: &mut Vec<u32>,
+    windowed: bool,
+    notice: Option<&str>,
+) -> AppNext {
+    const PER_PAGE: usize = 8;
+    let entries = replay::list();
+    let pages = entries.len().div_ceil(PER_PAGE).max(1);
+    let mut page = 0usize;
+    let mut t = 0u64;
+    let mut last_left = window.get_mouse_down(MouseButton::Left);
+    let mut last_mouse = v2(canvas.w as f32 / 2.0, canvas.h as f32 / 2.0);
+    let accent = rgb(120, 210, 220);
+    loop {
+        if !window.is_open() {
+            return AppNext::Quit;
+        }
+        sync_canvas(window, screen, canvas, x_map);
+        if let Some((rx, ry)) = window.get_mouse_pos(MouseMode::Discard) {
+            last_mouse = v2(rx * canvas.w as f32 / screen.w.max(1) as f32, ry * canvas.h as f32 / screen.h.max(1) as f32);
+        }
+        let mouse = last_mouse;
+        let left = window.get_mouse_down(MouseButton::Left);
+        let click = left && !last_left;
+        last_left = left;
+
+        let subtitle = if notice.is_some() { "" } else { "FINISHED MATCHES SAVE HERE AUTOMATICALLY" };
+        draw_menu_bg(canvas, t, "REPLAYS", subtitle, accent);
+        let cx = canvas.w / 2;
+        if let Some(n) = notice {
+            canvas.text_center(cx, 156, n, rgb(235, 120, 110), 2);
+        }
+        let (bw, bh, gap) = (640, 44, 10);
+        let mut y = canvas.h / 2 - 170;
+        if entries.is_empty() {
+            canvas.text_center(cx, y + 40, "NO REPLAYS YET", rgb(190, 200, 205), 3);
+            canvas.text_center(cx, y + 80, "PLAY A MATCH TO RECORD ONE", rgb(130, 145, 150), 2);
+        }
+        for (path, info) in entries.iter().skip(page * PER_PAGE).take(PER_PAGE) {
+            // "20260708-1530 SP - 2P - 12:34" from the timestamped filename.
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("REPLAY");
+            let stem = stem.strip_prefix("nanorts-").unwrap_or(stem);
+            let (m, s) = info.duration();
+            let label = format!("{}  -  {}P  -  {}:{:02}", stem.to_uppercase(), info.factions, m, s);
+            let b = Btn::new(cx, y, bw, bh, &label, accent);
+            let hover = b.hit(mouse);
+            b.draw(canvas, hover);
+            if click && hover {
+                return AppNext::Replay(path.clone());
+            }
+            y += bh + gap;
+        }
+        let back = Btn::new(cx, canvas.h - 92, 220, 44, "BACK  [ESC]", rgb(180, 190, 196));
+        let bhover = back.hit(mouse);
+        back.draw(canvas, bhover);
+        if (click && bhover) || window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+            return AppNext::Menu;
+        }
+        if pages > 1 {
+            let newer = Btn::new(cx - 230, canvas.h - 92, 200, 44, "< NEWER", accent);
+            let older = Btn::new(cx + 230, canvas.h - 92, 200, 44, "OLDER >", accent);
+            let (nhover, ohover) = (page > 0 && newer.hit(mouse), page + 1 < pages && older.hit(mouse));
+            if page > 0 {
+                newer.draw(canvas, nhover);
+            }
+            if page + 1 < pages {
+                older.draw(canvas, ohover);
+            }
+            canvas.text_center(cx, canvas.h - 38, &format!("PAGE {} / {}", page + 1, pages), rgb(130, 145, 150), 2);
+            let key = |k| window.is_key_pressed(k, KeyRepeat::Yes);
+            if page > 0 && ((click && nhover) || key(Key::Left) || key(Key::PageUp)) {
+                page -= 1;
+            } else if page + 1 < pages && ((click && ohover) || key(Key::Right) || key(Key::PageDown)) {
+                page += 1;
+            }
+        }
+        present_frame(window, screen, canvas, x_map);
+        if !windowed {
+            fullscreen_tick(t);
         }
         t += 1;
     }
@@ -836,6 +970,11 @@ fn make_world_sp(factions: usize, teams: [u8; world::MAX_FACTIONS], canvas: &Can
     w
 }
 
+/// A recorder capturing this world's match, from its own config.
+fn recorder_for(w: &World) -> replay::Recorder {
+    replay::Recorder::new(w.seed, w.factions, w.is_ai, w.alliance, w.my_team.idx(), w.versus)
+}
+
 /// The multiplayer world built from a lockstep session's shared config.
 fn make_world_mp(ls: &net::Lockstep, canvas: &Canvas) -> World {
     let mut is_ai = [false; world::MAX_FACTIONS];
@@ -854,6 +993,415 @@ fn apply_step(w: &mut World, per_faction: &[Vec<world::Cmd>]) {
         let team = Team::from_idx(f);
         for c in cmds {
             w.apply_cmd(team, c);
+        }
+    }
+}
+
+/// An AI exhibition world: every faction is an AI and the local viewer only
+/// observes. `versus` is set so the sim runs until one side remains, and the
+/// map starts revealed.
+fn make_world_spec(factions: usize, teams: [u8; world::MAX_FACTIONS], canvas: &Canvas) -> World {
+    let mut is_ai = [false; world::MAX_FACTIONS];
+    for slot in is_ai.iter_mut().take(factions) {
+        *slot = true;
+    }
+    let mut w = World::new_match_teams(seed(), factions, is_ai, Team::Player, true, teams);
+    w.reveal = true;
+    w.cam = v2(w.world_w / 2.0 - canvas.w as f32 / 2.0, w.world_h / 2.0 - canvas.h as f32 / 2.0);
+    w.clamp_cam(canvas.w as f32, canvas.h as f32);
+    w.messages.clear();
+    w.msg("AI EXHIBITION - SIT BACK AND WATCH");
+    w
+}
+
+/// Rebuild the world a replay was recorded from. Every constructor argument
+/// must match the original. That includes the viewer faction and `versus`,
+/// because the sim's end-of-match rules read both.
+fn make_world_replay(info: &replay::Info, canvas: &Canvas) -> World {
+    let viewer = if info.my_faction < world::MAX_FACTIONS {
+        Team::from_idx(info.my_faction)
+    } else {
+        Team::Player
+    };
+    let mut w = World::new_match_teams(info.seed, info.factions, info.is_ai, viewer, info.versus, info.alliance);
+    w.reveal = true; // start all-seeing; F drops to the recorder's fog
+    if let Some(b) = w.ents.iter().find(|e| e.kind == Kind::Base && e.team == w.my_team) {
+        let p = b.pos;
+        w.cam = v2(p.x - canvas.w as f32 / 2.0, p.y - canvas.h as f32 / 2.0);
+    }
+    w.clamp_cam(canvas.w as f32, canvas.h as f32);
+    w.messages.clear();
+    w
+}
+
+/// What drives an observer session: a live all-AI sim, or a recorded command
+/// stream re-applied step by step.
+enum ObsMode {
+    Live,
+    Replay { cmds: Vec<(u32, u8, world::Cmd)>, next: usize, final_step: u32 },
+}
+
+/// Playback speed steps on keys 1-4.
+const OBS_SPEEDS: [f32; 4] = [1.0, 2.0, 4.0, 16.0];
+
+/// The observer loop: replay playback and AI exhibitions. The local player
+/// only moves the camera, paces the clock, and toggles the fog. The only
+/// commands that reach the sim are a replay's recorded ones.
+#[allow(clippy::too_many_arguments)]
+fn run_observer(
+    window: &mut Window,
+    screen: &mut Canvas,
+    canvas: &mut Canvas,
+    x_map: &mut Vec<u32>,
+    windowed: bool,
+    audio: &Option<audio::Audio>,
+    bloom: &mut Option<gfx::Bloom>,
+    mut world: World,
+    mut mode: ObsMode,
+) -> GameOutcome {
+    let ui = Ui {
+        drag_start: None,
+        dragging: false,
+        build_mode: None,
+        attack_pending: false,
+        show_help: false,
+        menu: false,
+        observer: true,
+    };
+    const STEP: f32 = 1.0 / 60.0;
+    let mut accumulator = 0.0f32;
+    let mut last_tick = Instant::now();
+    let mut paused = false;
+    let mut speed_idx = 0usize;
+    let mut menu_open = false;
+    let mut last_mouse = v2(canvas.w as f32 / 2.0, canvas.h as f32 / 2.0);
+    let mut mid_pan: Option<V2> = None;
+    let mut prev_left = window.get_mouse_down(MouseButton::Left);
+    let mut frame_no = 0u64;
+
+    loop {
+        if !window.is_open() {
+            return GameOutcome::Quit;
+        }
+        frame_no += 1;
+        let now = Instant::now();
+        let frame_dt = (now - last_tick).as_secs_f32().min(0.25);
+        last_tick = now;
+
+        sync_canvas(window, screen, canvas, x_map);
+        world.view_w = canvas.w as f32;
+        world.view_h = canvas.h as f32;
+
+        // ---------------- input ----------------
+        if let Some((rx, ry)) = window.get_mouse_pos(MouseMode::Discard) {
+            last_mouse = v2(rx * canvas.w as f32 / screen.w.max(1) as f32, ry * canvas.h as f32 / screen.h.max(1) as f32);
+        }
+        let mouse = last_mouse;
+        let focused = window.is_active();
+        let pan_mouse = window
+            .get_mouse_pos(MouseMode::Clamp)
+            .map(|(rx, ry)| v2(rx * canvas.w as f32 / screen.w.max(1) as f32, ry * canvas.h as f32 / screen.h.max(1) as f32))
+            .unwrap_or(mouse);
+        let left = window.get_mouse_down(MouseButton::Left);
+        let middle = window.get_mouse_down(MouseButton::Middle);
+        let left_pressed = left && !prev_left;
+        prev_left = left;
+
+        // A replay is over once the match is decided, even if the recording
+        // kept running on the result screen afterwards.
+        let ended = match &mode {
+            ObsMode::Replay { final_step, .. } => world.match_over || world.step >= *final_step,
+            ObsMode::Live => world.match_over && world.time > 0.0,
+        };
+
+        for k in window.get_keys_pressed(KeyRepeat::No) {
+            if menu_open {
+                match k {
+                    Key::Escape => menu_open = false,
+                    Key::M => return GameOutcome::ToMenu,
+                    Key::Q => return GameOutcome::Quit,
+                    _ => {}
+                }
+                continue;
+            }
+            match k {
+                Key::Space => paused = !paused,
+                Key::Key1 | Key::NumPad1 => speed_idx = 0,
+                Key::Key2 | Key::NumPad2 => speed_idx = 1,
+                Key::Key3 | Key::NumPad3 => speed_idx = 2,
+                Key::Key4 | Key::NumPad4 => speed_idx = 3,
+                Key::F => world.reveal = !world.reveal,
+                // Cycle whose fog the un-revealed view shows. Versus only: a
+                // single-player sim's end rules read my_team, so it must stay.
+                Key::V if world.versus => {
+                    let cur = world.my_team.idx();
+                    world.my_team = Team::from_idx((cur + 1) % world.factions);
+                    world.seen_buildings.clear();
+                    world.attack_pings.clear();
+                    world.msg(&format!("VIEWING {}", faction_name(world.my_team)));
+                }
+                Key::M if ended => return GameOutcome::ToMenu,
+                Key::Q if ended => return GameOutcome::Quit,
+                Key::Escape => menu_open = true,
+                _ => {}
+            }
+        }
+
+        // Clickable observer menu: resume, main menu, quit.
+        if menu_open && left_pressed {
+            for (b, act) in obs_menu_buttons(canvas) {
+                if b.hit(mouse) {
+                    match act {
+                        MenuAct::Resume => menu_open = false,
+                        MenuAct::ToMenu => return GameOutcome::ToMenu,
+                        MenuAct::Quit => return GameOutcome::Quit,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // End-panel buttons.
+        if ended && !menu_open && left_pressed {
+            for (b, act) in gameover_buttons(canvas, true) {
+                if b.hit(mouse) {
+                    match act {
+                        MenuAct::ToMenu => return GameOutcome::ToMenu,
+                        MenuAct::Quit => return GameOutcome::Quit,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // ---------------- camera ----------------
+        if left && !menu_open && in_minimap(mouse, canvas.w, canvas.h) {
+            let wp = mm_to_world(mouse, canvas.w, canvas.h, world.world_w, world.world_h);
+            world.cam = v2(wp.x - canvas.w as f32 / 2.0, wp.y - canvas.h as f32 / 2.0);
+        }
+        let mut panning = false;
+        if middle && focused && !menu_open {
+            if let Some(prev) = mid_pan {
+                world.cam = world.cam.sub(pan_mouse.sub(prev));
+            }
+            mid_pan = Some(pan_mouse);
+            panning = true;
+        } else {
+            mid_pan = None;
+        }
+        let pan = if menu_open { 0.0 } else { 760.0 * frame_dt };
+        if window.is_key_down(Key::Left) {
+            world.cam.x -= pan;
+        }
+        if window.is_key_down(Key::Right) {
+            world.cam.x += pan;
+        }
+        if window.is_key_down(Key::Up) {
+            world.cam.y -= pan;
+        }
+        if window.is_key_down(Key::Down) {
+            world.cam.y += pan;
+        }
+        if focused && !panning && !in_minimap(pan_mouse, canvas.w, canvas.h) {
+            let band = 18.0;
+            if pan_mouse.x <= band {
+                world.cam.x -= pan;
+            }
+            if pan_mouse.x >= canvas.w as f32 - band {
+                world.cam.x += pan;
+            }
+            if pan_mouse.y <= band {
+                world.cam.y -= pan;
+            }
+            if pan_mouse.y >= canvas.h as f32 - band {
+                world.cam.y += pan;
+            }
+        }
+        world.clamp_cam(canvas.w as f32, canvas.h as f32);
+
+        // ---------------- advance the sim ----------------
+        let speed = OBS_SPEEDS[speed_idx];
+        if paused || menu_open {
+            accumulator = 0.0;
+        } else {
+            accumulator += frame_dt * speed;
+            let mut steps = 0;
+            // Enough headroom per frame for 16x, without hitching the render.
+            while accumulator >= STEP && steps < 24 {
+                match &mut mode {
+                    ObsMode::Replay { cmds, next, final_step } => {
+                        if world.step >= *final_step {
+                            accumulator = 0.0;
+                            break;
+                        }
+                        while *next < cmds.len() && cmds[*next].0 <= world.step {
+                            let (_, f, c) = &cmds[*next];
+                            world.apply_cmd(Team::from_idx(*f as usize), c);
+                            *next += 1;
+                        }
+                        world.update(STEP);
+                    }
+                    // A decided live match keeps ticking so its effects fade
+                    // out behind the result panel.
+                    ObsMode::Live => world.update(STEP),
+                }
+                accumulator -= STEP;
+                steps += 1;
+            }
+            if accumulator > STEP * 10.0 {
+                accumulator = STEP * 10.0;
+            }
+        }
+
+        // Sounds: normal speeds keep the battle audible; at fast-forward the
+        // stream would be a smear, so drop it.
+        if let Some(a) = audio {
+            if speed <= 2.0 && !paused {
+                let vmin = world.cam;
+                let vmax = v2(world.cam.x + canvas.w as f32, world.cam.y + canvas.h as f32);
+                for (s, pos) in world.sounds.drain(..) {
+                    let (gain, pan) = match pos {
+                        None => (1.0, 0.0),
+                        Some(p) => sound_at_view(vmin, vmax, p),
+                    };
+                    a.play(s, gain, pan);
+                }
+            }
+        }
+        world.sounds.clear();
+
+        // ---------------- draw ----------------
+        render(canvas, &world, &ui, mouse);
+        draw_obs_hud(canvas, &world, &mode, paused, speed_idx);
+        if ended {
+            draw_obs_end(canvas, &world, &mode, mouse);
+        }
+        if menu_open {
+            canvas.fill_rect_a(0, 0, canvas.w, canvas.h, INK, 0.72);
+            canvas.text_center(canvas.w / 2, canvas.h / 2 - 130, "PAUSED", rgb(255, 240, 200), 6);
+            for (b, _) in obs_menu_buttons(canvas) {
+                let hover = b.hit(mouse);
+                b.draw(canvas, hover);
+            }
+        }
+        if let Some(bl) = bloom.as_mut() {
+            bl.apply(canvas);
+        }
+        present_frame(window, screen, canvas, x_map);
+        if !windowed {
+            fullscreen_tick(frame_no);
+        }
+    }
+}
+
+/// Observer pause-menu buttons. There is no surrender: nobody is playing.
+fn obs_menu_buttons(c: &Canvas) -> Vec<(Btn, MenuAct)> {
+    let cx = c.w / 2;
+    let (bw, bh, gap) = (320, 50, 14);
+    let y0 = c.h / 2 - 44;
+    vec![
+        (Btn::new(cx, y0, bw, bh, "RESUME  [ESC]", rgb(120, 230, 150)), MenuAct::Resume),
+        (Btn::new(cx, y0 + (bh + gap), bw, bh, "MAIN MENU  [M]", rgb(90, 200, 255)), MenuAct::ToMenu),
+        (Btn::new(cx, y0 + 2 * (bh + gap), bw, bh, "QUIT  [Q]", rgb(240, 130, 120)), MenuAct::Quit),
+    ]
+}
+
+/// The observer's HUD: a census strip for every faction up top, with the
+/// clock and transport state, and a control strip along the bottom edge.
+fn draw_obs_hud(c: &mut Canvas, w: &World, mode: &ObsMode, paused: bool, speed_idx: usize) {
+    c.fill_rect_a(0, 0, c.w, HUD_H, INK, 0.88);
+    c.fill_rect(0, HUD_H, c.w, 1, rgb(60, 66, 56));
+
+    // Census per faction: workers / army supply, in the faction's colour chip.
+    let mut x = 10;
+    for f in 0..w.factions {
+        let t = Team::from_idx(f);
+        let mut workers = 0;
+        let mut army = 0;
+        for e in &w.ents {
+            if e.team == t {
+                match e.kind {
+                    Kind::Worker => workers += 1,
+                    k if world::is_army(k) => army += world::supply_cost(k),
+                    _ => {}
+                }
+            }
+        }
+        let dead = !w.faction_alive(t);
+        c.fill_rect(x, 9, 10, 10, if dead { rgb(70, 74, 80) } else { fill_of(t) });
+        let label = if dead {
+            format!("{} OUT", faction_name(t))
+        } else {
+            format!("{} {}W {}A", faction_name(t), workers, army)
+        };
+        let col = if dead { rgb(110, 118, 124) } else { rgb(200, 210, 220) };
+        c.text_sh(x + 16, 8, &label, col, 2);
+        x += 16 + Canvas::text_width(&label, 2) + 22;
+    }
+
+    // Clock and transport, right-aligned. The mode word is dropped when the
+    // census strip needs the room.
+    let mins = (w.time as i32) / 60;
+    let secs = (w.time as i32) % 60;
+    let transport = if paused {
+        "PAUSED".to_string()
+    } else {
+        format!("{}X", OBS_SPEEDS[speed_idx] as i32)
+    };
+    let what = match mode {
+        ObsMode::Live => "EXHIBITION",
+        ObsMode::Replay { .. } => "REPLAY",
+    };
+    let mut right = format!("{}   {}   {}:{:02}", what, transport, mins, secs);
+    if c.w - Canvas::text_width(&right, 2) - 10 < x {
+        right = format!("{}   {}:{:02}", transport, mins, secs);
+    }
+    let rw = Canvas::text_width(&right, 2);
+    c.text_sh(c.w - rw - 10, 8, &right, rgb(190, 205, 210), 2);
+
+    // Floating messages, stacked just under the HUD.
+    for (i, (m, life)) in w.messages.iter().rev().take(4).enumerate() {
+        let a = (life / 3.2).clamp(0.0, 1.0);
+        let col = gfx::mix(rgb(22, 25, 20), rgb(255, 240, 200), a);
+        c.text_center(c.w / 2, HUD_H + 10 + i as i32 * 18, m, col, 2);
+    }
+
+    // Bottom control strip.
+    let fog = if w.reveal { "ALL" } else { faction_name(w.my_team) };
+    let mut line = format!("SPACE PAUSE  -  1-4 SPEED  -  F FOG ({})", fog);
+    if w.versus {
+        line.push_str("  -  V VIEWPOINT");
+    }
+    line.push_str("  -  ESC MENU");
+    c.fill_rect_a(0, c.h - 22, c.w, 22, INK, 0.8);
+    c.text_sh(10, c.h - 18, &line, rgb(205, 210, 220), 2);
+}
+
+/// The observer's end panel: who won, the match graphs, and the exits.
+fn draw_obs_end(c: &mut Canvas, w: &World, mode: &ObsMode, mouse: V2) {
+    c.fill_rect_a(0, 0, c.w, c.h, INK, 0.7);
+    // Name the winners: the surviving side, or however the replay left things.
+    let alive: Vec<Team> = (0..w.factions).map(Team::from_idx).filter(|&t| w.faction_alive(t)).collect();
+    let (title, col) = if !w.match_over {
+        // A replay ends mid-fight when the recorder left before the result.
+        let what = if matches!(mode, ObsMode::Replay { .. }) { "REPLAY OVER" } else { "EXHIBITION OVER" };
+        (what.to_string(), rgb(200, 210, 220))
+    } else if alive.is_empty() {
+        ("MUTUAL DESTRUCTION".to_string(), rgb(240, 200, 110))
+    } else if !alive.iter().all(|&t| w.allied(alive[0], t)) {
+        // A single-player match stops when the viewer's side falls, with the
+        // surviving rivals still at war. Nobody has won.
+        (format!("{} DEFEATED", faction_name(w.my_team)), fill_of(w.my_team))
+    } else {
+        let names: Vec<&str> = alive.iter().map(|&t| faction_name(t)).collect();
+        let verb = if names.len() == 1 { "WINS" } else { "WIN" };
+        (format!("{} {}", names.join(" + "), verb), fill_of(alive[0]))
+    };
+    c.text_center(c.w / 2, c.h / 2 - 190, &title, col, 7);
+    draw_stats_panels(c, w, c.h / 2 - 100);
+    for (b, act) in gameover_buttons(c, true) {
+        if matches!(act, MenuAct::ToMenu | MenuAct::Quit) {
+            let hover = b.hit(mouse);
+            b.draw(c, hover);
         }
     }
 }
@@ -958,6 +1506,10 @@ fn main() {
     // (smaller buffer = easy 60 fps; also handy for testing).
     let windowed = std::env::args().any(|a| a == "--windowed" || a == "-w");
 
+    // The bloom post-pass makes everything bright in the frame glow. On by
+    // default; `--no-bloom` turns it off to save CPU.
+    let mut bloom = if args.iter().any(|a| a == "--no-bloom") { None } else { Some(gfx::Bloom::new()) };
+
     // Multiplayer mode: --host [port] or --join <ip:port>.
     let mp_host_port: Option<u16> = args
         .iter()
@@ -1047,6 +1599,34 @@ fn main() {
                 continue 'app;
             }
             AppNext::Single(factions, teams) => (None, make_world_sp(factions, teams, &canvas)),
+            AppNext::Spectate(factions, teams) => {
+                let w = make_world_spec(factions, teams, &canvas);
+                match run_observer(&mut window, &mut screen, &mut canvas, &mut x_map, windowed, &audio, &mut bloom, w, ObsMode::Live) {
+                    GameOutcome::Quit => break,
+                    GameOutcome::ToMenu => {
+                        next = AppNext::Menu;
+                        continue 'app;
+                    }
+                }
+            }
+            AppNext::Replay(path) => {
+                next = match replay::load(&path) {
+                    Ok(rp) => {
+                        let w = make_world_replay(&rp.info, &canvas);
+                        let mode = ObsMode::Replay { cmds: rp.cmds, next: 0, final_step: rp.info.final_step };
+                        match run_observer(&mut window, &mut screen, &mut canvas, &mut x_map, windowed, &audio, &mut bloom, w, mode) {
+                            GameOutcome::Quit => break,
+                            GameOutcome::ToMenu => AppNext::Menu,
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("could not load replay {}: {e}", path.display());
+                        let notice = Some("THAT REPLAY COULD NOT BE LOADED");
+                        run_replay_list(&mut window, &mut screen, &mut canvas, &mut x_map, windowed, notice)
+                    }
+                };
+                continue 'app;
+            }
             AppNext::Host(port) => match run_host_lobby(&mut window, &mut screen, &mut canvas, &mut x_map, windowed, port) {
                 Some(ls) => {
                     let w = make_world_mp(&ls, &canvas);
@@ -1076,7 +1656,11 @@ fn main() {
             attack_pending: false,
             show_help: false,
             menu: false,
+            observer: false,
         };
+        // Record the match as it happens: every command, stamped with the sim
+        // step it lands on. Finished recordings become files under replays/.
+        let mut rec = Some(recorder_for(&world));
         let mut done: Option<GameOutcome> = None;
         // Seed from the live button state so a click still held from the menu
         // (e.g. the one that chose "Single Player") isn't read as a fresh
@@ -1169,6 +1753,9 @@ fn main() {
                             world.over = -1;
                             if net.is_some() {
                                 frame_cmds.push(world::Cmd::Surrender);
+                            } else if let Some(r) = rec.take() {
+                                // A solo surrender ends the match: bank it.
+                                r.finish(world.step);
                             }
                             ui.menu = false;
                         }
@@ -1186,7 +1773,15 @@ fn main() {
                         // Reuse the current match's player count and team setup
                         // so "play again" keeps the mode you chose.
                         Key::R if net.is_none() => {
+                            // Bank the finished match's replay, then record the new one.
+                            if let Some(r) = rec.take() {
+                                r.finish(world.step);
+                            }
                             world = make_world_sp(world.factions, world.alliance, &canvas);
+                            rec = Some(recorder_for(&world));
+                            // Entity ids restart with the world, so old groups are void.
+                            groups.iter_mut().for_each(Vec::clear);
+                            last_recall = None;
                             ui.build_mode = None;
                             ui.attack_pending = false;
                             ui.dragging = false;
@@ -1281,6 +1876,13 @@ fn main() {
                         }
                     }
                     Key::S => frame_cmds.push(world::Cmd::Stop { ids: world.selected_ids() }),
+                    // Jump the camera to the last UNDER ATTACK alarm.
+                    Key::Space => {
+                        if let Some(p) = world.last_alert {
+                            world.cam = v2(p.x - canvas.w as f32 / 2.0, p.y - canvas.h as f32 / 2.0);
+                            world.clamp_cam(canvas.w as f32, canvas.h as f32);
+                        }
+                    }
                     Key::H => ui.show_help = !ui.show_help,
                     Key::Escape => {
                         // Cancel an active targeting mode first; otherwise open the
@@ -1324,11 +1926,19 @@ fn main() {
                                 world.over = -1;
                                 if net.is_some() {
                                     frame_cmds.push(world::Cmd::Surrender);
+                                } else if let Some(r) = rec.take() {
+                                    r.finish(world.step);
                                 }
                                 ui.menu = false;
                             }
                             MenuAct::Restart if net.is_none() => {
+                                if let Some(r) = rec.take() {
+                                    r.finish(world.step);
+                                }
                                 world = make_world_sp(world.factions, world.alliance, &canvas);
+                                rec = Some(recorder_for(&world));
+                                groups.iter_mut().for_each(Vec::clear);
+                                last_recall = None;
                                 ui.build_mode = None;
                                 ui.attack_pending = false;
                                 ui.dragging = false;
@@ -1344,12 +1954,12 @@ fn main() {
             if !in_overlay && left && in_minimap(mouse, canvas.w, canvas.h) {
                 let wp = mm_to_world(mouse, canvas.w, canvas.h, world.world_w, world.world_h);
                 if left_pressed && ui.attack_pending {
-                    // A + minimap click = attack-move across the map.
-                    let tgt = world.snap_to_enemy(wp, 130.0).unwrap_or(wp);
+                    // A + minimap click = attack-move across the map, to the
+                    // raw point. Attack-move is an area gesture, so no snapping.
                     frame_cmds.push(world::Cmd::Order {
                         ids: world.selected_ids(),
-                        x: tgt.x,
-                        y: tgt.y,
+                        x: wp.x,
+                        y: wp.y,
                         attack_move: true,
                         queue: shift,
                     });
@@ -1516,8 +2126,13 @@ fn main() {
                     ls.queue(c);
                 }
             } else {
+                // Single-player: apply immediately, logging each command at
+                // the current sim step so a replay re-applies it right there.
                 let mt = world.my_team;
                 for c in frame_cmds.drain(..) {
+                    if let Some(r) = rec.as_mut() {
+                        r.record(world.step, mt.idx(), &c);
+                    }
                     world.apply_cmd(mt, &c);
                 }
             }
@@ -1535,7 +2150,17 @@ fn main() {
                         if !ls.ready() {
                             break;
                         }
-                        apply_step(&mut world, &ls.step_cmds());
+                        // Log every faction's commands for this step, in the
+                        // order they are fed to the sim.
+                        let step_cmds = ls.step_cmds();
+                        if let Some(r) = rec.as_mut() {
+                            for (f, cmds) in step_cmds.iter().enumerate() {
+                                for c in cmds {
+                                    r.record(world.step, f, c);
+                                }
+                            }
+                        }
+                        apply_step(&mut world, &step_cmds);
                         world.update(STEP);
                         ls.advanced(world.checksum());
                         accumulator -= STEP;
@@ -1557,6 +2182,13 @@ fn main() {
                     steps += 1;
                 }
             }
+            // Bank the recording once the match is decided, so time spent on
+            // the result screen is not part of the replay.
+            if world.match_over {
+                if let Some(r) = rec.take() {
+                    r.finish(world.step);
+                }
+            }
             // Hand this tick's sound events to the synth, faded by how far each
             // is from the current view (and panned across the stereo field).
             if let Some(a) = &audio {
@@ -1576,6 +2208,9 @@ fn main() {
             if let Some(ls) = &net {
                 draw_sync_badge(&mut canvas, ls);
             }
+            if let Some(bl) = bloom.as_mut() {
+                bl.apply(&mut canvas);
+            }
             blit_scaled(&canvas, &mut screen, &x_map);
             // Only present when the screen buffer matches the window exactly (so we
             // never trigger minifb's scaler). On a size mismatch or a minimized /
@@ -1592,6 +2227,11 @@ fn main() {
             if !windowed {
                 fullscreen_tick(frame_no);
             }
+        }
+
+        // Bank a recording that ended undecided. Short ones are dropped.
+        if let Some(r) = rec.take() {
+            r.finish(world.step);
         }
 
         // The match ended (or the player chose to leave). Quit the app, or fall
@@ -2355,40 +2995,43 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
     // ---- Fog of war: black out the unseen, dim what's only remembered. ----
     // `vis` holds one grid per faction back to back; read from the LOCAL
     // viewer's slice (as the minimap does), so a joining peer sees their own
-    // fog rather than the host's.
-    let cs = w.fog_cell as i32;
-    let fog_base = w.my_team.idx() * (w.fog_w * w.fog_h);
-    let gx0 = (camx / cs).max(0);
-    let gy0 = (camy / cs).max(0);
-    let gx1 = (((camx + c.w) / cs) + 1).min(w.fog_w as i32 - 1);
-    let gy1 = (((camy + c.h) / cs) + 1).min(w.fog_h as i32 - 1);
-    let unseen = rgb(6, 7, 10);
-    // Film grain re-rolls its fleck positions ~9 times a second — fast enough
-    // to shimmer, slow enough not to strobe.
-    let grain_t = (w.time * 9.0) as u32;
-    for gy in gy0..=gy1 {
-        let row = fog_base + gy as usize * w.fog_w;
-        for gx in gx0..=gx1 {
-            let v = w.vis[row + gx as usize];
-            if v == 2 {
-                continue;
-            }
-            let sx = gx * cs - camx;
-            let sy = gy * cs - camy;
-            if v == 0 {
-                c.fill_rect(sx, sy, cs, cs, unseen);
-                // A few faint flecks per cell so the unexplored void reads as
-                // drifting fog rather than dead black. Render-side only.
-                let mut h = grain_hash(gx, gy, grain_t);
-                for _ in 0..3 {
-                    let dx = (h & 0xFFFF) as i32 % cs;
-                    let dy = ((h >> 16) & 0xFFFF) as i32 % cs;
-                    let br = 0.05 + ((h >> 32) & 7) as f32 * 0.012;
-                    c.add_px(sx + dx, sy + dy, rgb(95, 115, 135), br);
-                    h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (h >> 29);
+    // fog rather than the host's. An observer with `reveal` set skips the
+    // shroud entirely.
+    if !w.reveal {
+        let cs = w.fog_cell as i32;
+        let fog_base = w.my_team.idx() * (w.fog_w * w.fog_h);
+        let gx0 = (camx / cs).max(0);
+        let gy0 = (camy / cs).max(0);
+        let gx1 = (((camx + c.w) / cs) + 1).min(w.fog_w as i32 - 1);
+        let gy1 = (((camy + c.h) / cs) + 1).min(w.fog_h as i32 - 1);
+        let unseen = rgb(6, 7, 10);
+        // Film grain re-rolls its fleck positions nine times a second: fast
+        // enough to shimmer, slow enough not to strobe.
+        let grain_t = (w.time * 9.0) as u32;
+        for gy in gy0..=gy1 {
+            let row = fog_base + gy as usize * w.fog_w;
+            for gx in gx0..=gx1 {
+                let v = w.vis[row + gx as usize];
+                if v == 2 {
+                    continue;
                 }
-            } else {
-                c.fill_rect_a(sx, sy, cs, cs, unseen, 0.55);
+                let sx = gx * cs - camx;
+                let sy = gy * cs - camy;
+                if v == 0 {
+                    c.fill_rect(sx, sy, cs, cs, unseen);
+                    // A few faint flecks per cell so the unexplored void reads
+                    // as drifting fog rather than dead black. Render-side only.
+                    let mut h = grain_hash(gx, gy, grain_t);
+                    for _ in 0..3 {
+                        let dx = (h & 0xFFFF) as i32 % cs;
+                        let dy = ((h >> 16) & 0xFFFF) as i32 % cs;
+                        let br = 0.05 + ((h >> 32) & 7) as f32 * 0.012;
+                        c.add_px(sx + dx, sy + dy, rgb(95, 115, 135), br);
+                        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (h >> 29);
+                    }
+                } else {
+                    c.fill_rect_a(sx, sy, cs, cs, unseen, 0.55);
+                }
             }
         }
     }
@@ -2469,6 +3112,11 @@ fn render(c: &mut Canvas, w: &World, ui: &Ui, mouse: V2) {
     }
 
     draw_minimap(c, w);
+    if ui.observer {
+        // The observer loop draws its own HUD, pause menu, and end panel
+        // over this frame.
+        return;
+    }
     draw_hud(c, w, ui);
     if ui.show_help {
         draw_help(c);
@@ -2841,11 +3489,13 @@ fn draw_minimap(c: &mut Canvas, w: &World) {
 
     // Fog of war on the minimap: black out what you've never seen, and dim the
     // ground you've explored but can't currently see — so the map fills in as you
-    // scout and you can read where you've already been.
+    // scout and you can read where you've already been. Skipped for a revealed
+    // observer view.
     let cells = w.fog_w * w.fog_h;
     let base = w.my_team.idx() * cells;
     let unseen = rgb(11, 12, 15);
-    for fy in 0..w.fog_h {
+    let fog_rows = if w.reveal { 0 } else { w.fog_h };
+    for fy in 0..fog_rows {
         for fx in 0..w.fog_w {
             let v = w.vis[base + fy * w.fog_w + fx];
             if v == 2 {
@@ -3010,6 +3660,7 @@ fn draw_help(c: &mut Canvas) {
         "CTRL+1..9      SET GROUP   1..9 RECALL (DBL = CENTER)",
         "CTRL+A         SELECT WHOLE ARMY (NO WORKERS)",
         "A   S          ATTACK-MOVE   STOP",
+        "SPACE          JUMP TO THE LAST UNDER-ATTACK ALARM",
         "ESC            PAUSE MENU (RESUME / SURRENDER / QUIT)",
         "",
         "WORKER:  [B]ARRACKS [F]ACTORY [D]EPOT [C]CMD [T]URRET",
@@ -3057,14 +3708,105 @@ fn draw_gameover(c: &mut Canvas, w: &World, mouse: V2) {
     } else {
         ("DEFEAT", rgb(240, 90, 80))
     };
-    c.text_center(c.w / 2, c.h / 2 - 120, title, col, 9);
+    c.text_center(c.w / 2, c.h / 2 - 190, title, col, 9);
     let mins = (w.time as i32) / 60;
     let secs = (w.time as i32) % 60;
     let sub = format!("KILLS {}   TIME {}:{:02}", w.kills, mins, secs);
-    c.text_center(c.w / 2, c.h / 2 - 28, &sub, rgb(220, 220, 230), 3);
+    c.text_center(c.w / 2, c.h / 2 - 118, &sub, rgb(220, 220, 230), 3);
+    draw_stats_panels(c, w, c.h / 2 - 90);
     for (b, _) in gameover_buttons(c, w.versus) {
         let hover = b.hit(mouse);
         b.draw(c, hover);
+    }
+}
+
+/// Compact "12500" -> "12.5K" for graph max labels.
+fn fmt_amount(v: u32) -> String {
+    if v >= 10_000 {
+        format!("{}.{}K", v / 1000, (v % 1000) / 100)
+    } else {
+        format!("{}", v)
+    }
+}
+
+/// The end-of-match graphs: two small line charts, each faction's army value
+/// and its cumulative minerals mined, sharing one legend row. Series colours
+/// are the faction colours used everywhere else.
+fn draw_stats_panels(c: &mut Canvas, w: &World, top: i32) {
+    let n = w.stats.len();
+    let gap = 28;
+    let pw = ((c.w - 3 * gap) / 2).clamp(180, 330);
+    let ph = 104;
+    let total_w = pw * 2 + gap;
+    let x0 = (c.w - total_w) / 2;
+    let titles = ["ARMY VALUE", "MINERALS MINED"];
+    let frame = rgb(70, 76, 66);
+    let grid = rgb(38, 43, 37);
+    let ink_dim = rgb(140, 152, 150);
+
+    for (pi, title) in titles.iter().enumerate() {
+        let px = x0 + pi as i32 * (pw + gap);
+        let py = top + 16;
+        c.text(px, top, title, rgb(200, 210, 205), 2);
+        c.fill_rect_a(px, py, pw, ph, rgb(10, 12, 10), 0.85);
+        // Recessive gridlines at quarter heights, then the frame on top.
+        for q in 1..4 {
+            c.fill_rect(px + 1, py + ph * q / 4, pw - 2, 1, grid);
+        }
+        c.rect(px, py, pw, ph, frame);
+        if n < 2 {
+            c.text_center(px + pw / 2, py + ph / 2 - 7, "NO DATA", ink_dim, 2);
+            continue;
+        }
+        // Per-panel scale over every faction's series.
+        let value = |s: &world::FacStat| if pi == 0 { s.army } else { s.mined };
+        let mut vmax = 1u32;
+        for row in &w.stats {
+            for s in row.iter().take(w.factions) {
+                vmax = vmax.max(value(s));
+            }
+        }
+        // One point per pixel column, sampled from the series however many
+        // samples it holds.
+        let plot_w = pw - 8;
+        let plot_h = ph - 10;
+        let base_y = py + ph - 5;
+        for f in 0..w.factions {
+            let col = fill_of(Team::from_idx(f));
+            let mut prev: Option<(i32, i32)> = None;
+            for sx in 0..plot_w {
+                let idx = (sx as usize * (n - 1)) / (plot_w - 1).max(1) as usize;
+                let v = value(&w.stats[idx][f]);
+                let x = px + 4 + sx;
+                let y = base_y - ((v as f32 / vmax as f32) * plot_h as f32) as i32;
+                if let Some((lx, ly)) = prev {
+                    // 2px stroke: the line and a 1px-shifted twin.
+                    c.line(lx, ly, x, y, col);
+                    c.line(lx, ly - 1, x, y - 1, col);
+                }
+                prev = Some((x, y));
+            }
+        }
+        // Scale labels in muted ink, never in a series colour.
+        c.text(px + 4, py + 3, &fmt_amount(vmax), ink_dim, 1);
+        let (m, s) = ((w.stats.len() as u32) / 60, (w.stats.len() as u32) % 60);
+        let dur = format!("{}:{:02}", m, s);
+        let dw = Canvas::text_width(&dur, 1);
+        c.text(px + pw - dw - 4, py + ph - 9, &dur, ink_dim, 1);
+    }
+
+    // Shared legend: a colour chip and the faction's name for every live slot.
+    let mut lw = 0;
+    for f in 0..w.factions {
+        lw += 14 + Canvas::text_width(faction_name(Team::from_idx(f)), 2) + 18;
+    }
+    let mut lx = (c.w - lw) / 2;
+    let ly = top + 16 + ph + 10;
+    for f in 0..w.factions {
+        let t = Team::from_idx(f);
+        c.fill_rect(lx, ly + 2, 8, 8, fill_of(t));
+        c.text(lx + 14, ly, faction_name(t), rgb(185, 196, 195), 2);
+        lx += 14 + Canvas::text_width(faction_name(t), 2) + 18;
     }
 }
 
@@ -3122,10 +3864,157 @@ mod tests {
             attack_pending: false,
             show_help: false,
             menu: false,
+            observer: false,
         };
         render(&mut c, &w, &ui, v2(0.0, 0.0));
         // The base pixel must not be the exact "never seen" fog fill.
         assert_ne!(c.buf[240 * 640 + 320], rgb(6, 7, 10));
+    }
+
+    /// Write a canvas as a PPM into the NANORTS_DUMP directory, when set, so
+    /// a rendered screen can be looked at, not just asserted about.
+    fn dump(c: &Canvas, name: &str) {
+        let Ok(dir) = std::env::var("NANORTS_DUMP") else {
+            return;
+        };
+        let mut out = format!("P6\n{} {}\n255\n", c.w, c.h).into_bytes();
+        for &px in &c.buf {
+            out.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8]);
+        }
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), out);
+    }
+
+    /// Observer-path smoke: a revealed all-AI frame with the observer HUD and
+    /// end panel draws without panicking, and the fog stays lifted.
+    #[test]
+    fn observer_frame_and_end_panel_draw() {
+        let mut w = World::new_match_teams(11, 4, [true; 4], Team::Player, true, [0, 1, 2, 3]);
+        w.reveal = true;
+        for _ in 0..60 * 60 {
+            w.update(1.0 / 60.0); // a minute of battle fills the stat series
+        }
+        let mut c = Canvas::new(1280, 720);
+        w.cam = v2(w.world_w / 2.0 - 640.0, w.world_h / 2.0 - 360.0);
+        let ui = Ui {
+            drag_start: None,
+            dragging: false,
+            build_mode: None,
+            attack_pending: false,
+            show_help: false,
+            menu: false,
+            observer: true,
+        };
+        render(&mut c, &w, &ui, v2(10.0, 10.0));
+        draw_obs_hud(&mut c, &w, &ObsMode::Live, false, 2);
+        draw_obs_end(&mut c, &w, &ObsMode::Live, v2(0.0, 0.0));
+        dump(&c, "observer.ppm");
+        assert!(w.stats.len() > 30, "a minute of sim samples the stats");
+        assert!(c.buf.iter().any(|&px| px != rgb(6, 7, 10)), "the frame drew something");
+    }
+
+    /// The bloom shot: stage a firefight, render the same frame with and
+    /// without the glow pass, and dump both for eyeballing. Asserts the pass
+    /// only ever brightens and actually did something.
+    #[test]
+    fn bloom_brightens_a_battle_frame() {
+        let mut w = World::new_match_teams(11, 2, [true, true, false, false], Team::Player, true, [0, 1, 2, 3]);
+        w.reveal = true;
+        for _ in 0..60 * 30 {
+            w.update(1.0 / 60.0);
+        }
+        // Stage a close-quarters firefight mid-map so the frame has live
+        // tracers, impact sparks, and an explosion in flight.
+        let c0 = v2(w.world_w / 2.0, w.world_h / 2.0);
+        for k in 0..6 {
+            w.spawn(Kind::Soldier, Team::Player, c0.add(v2(-60.0, k as f32 * 20.0 - 60.0)));
+            w.spawn(Kind::Soldier, Team::Enemy, c0.add(v2(60.0, k as f32 * 20.0 - 60.0)));
+        }
+        w.spawn(Kind::Tank, Team::Player, c0.add(v2(-110.0, 0.0)));
+        w.spawn(Kind::Tank, Team::Enemy, c0.add(v2(110.0, 0.0)));
+        for _ in 0..50 {
+            w.update(1.0 / 60.0);
+        }
+        // A mid-expansion explosion: the shockwave ring a third of the way
+        // out, plus the spray of glow particles the real blast code emits.
+        let bp = c0.add(v2(0.0, -40.0));
+        w.shocks.push(world::Shock { pos: bp, max_r: 70.0, life: 0.29, max_life: 0.42, color: rgb(255, 190, 110) });
+        for i in 0..28 {
+            let a = i as f32 * 0.23;
+            let d = 4.0 + (i % 7) as f32 * 4.5;
+            w.particles.push(world::Particle {
+                pos: bp.add(v2(a.cos() * d, a.sin() * d)),
+                vel: v2(0.0, 0.0),
+                life: 0.5,
+                max_life: 0.55,
+                size: 3.0 + (i % 3) as f32 * 1.5,
+                color: if i % 3 == 0 { rgb(255, 240, 200) } else { rgb(255, 160, 70) },
+                drag: 2.0,
+                grav: 0.0,
+                glow: true,
+            });
+        }
+
+        let mut c = Canvas::new(1280, 720);
+        w.cam = v2(c0.x - 640.0, c0.y - 360.0);
+        let ui = Ui {
+            drag_start: None,
+            dragging: false,
+            build_mode: None,
+            attack_pending: false,
+            show_help: false,
+            menu: false,
+            observer: false,
+        };
+        render(&mut c, &w, &ui, v2(10.0, 10.0));
+        dump(&c, "bloom_before.ppm");
+        let before = c.buf.clone();
+
+        // Steady-state cost: restore the pristine frame before each run, so
+        // the timing excludes buffer allocation and bloom stacking on bloom.
+        let mut bl = gfx::Bloom::new();
+        bl.apply(&mut c);
+        let runs = 20;
+        let t0 = Instant::now();
+        for _ in 0..runs {
+            c.buf.copy_from_slice(&before);
+            bl.apply(&mut c);
+        }
+        eprintln!("bloom apply: {:?}/frame (incl. one full-frame restore)", t0.elapsed() / runs);
+        dump(&c, "bloom_after.ppm");
+
+        let mut brighter = 0usize;
+        for (a, b) in before.iter().zip(c.buf.iter()) {
+            let (ar, br) = ((a >> 16) & 0xFF, (b >> 16) & 0xFF);
+            assert!(br >= ar, "bloom must never darken a pixel");
+            if b != a {
+                brighter += 1;
+            }
+        }
+        assert!(brighter > 500, "the glow should touch a real area, got {brighter} px");
+    }
+
+    /// The game-over screen with its stats panels draws without panicking.
+    #[test]
+    fn gameover_stats_panels_draw() {
+        let mut w = World::new(7);
+        for _ in 0..60 * 90 {
+            w.update(1.0 / 60.0);
+        }
+        w.over = 1;
+        let mut c = Canvas::new(1280, 720);
+        let ui = Ui {
+            drag_start: None,
+            dragging: false,
+            build_mode: None,
+            attack_pending: false,
+            show_help: false,
+            menu: false,
+            observer: false,
+        };
+        render(&mut c, &w, &ui, v2(10.0, 10.0));
+        dump(&c, "gameover.ppm");
+        assert!(!w.stats.is_empty());
+        assert!(w.mined[0] > 0 || w.mined[1] > 0, "someone mined something in 90s");
     }
 
     /// Smoke: a 2v2 frame with a selected turret, a placement ghost, and the
@@ -3153,6 +4042,7 @@ mod tests {
             attack_pending: false,
             show_help: true,
             menu: false,
+            observer: false,
         };
         render(&mut c, &w, &ui, v2(320.0, 240.0));
         assert!(c.buf.iter().any(|&px| px != rgb(6, 7, 10)), "the frame drew something");

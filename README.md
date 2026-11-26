@@ -109,11 +109,37 @@ spectate on — the match runs until one side remains.
 | `T` | Build a Turret (worker selected — the same key trains a Tank when a Factory is selected instead) |
 | `A` | Attack-move (then left-click a destination) |
 | `S` | Stop |
+| `Space` | Jump the camera to the last **UNDER ATTACK** alarm |
 | Arrow keys / screen edges | Scroll the map |
 | Minimap | Click to jump the camera |
 | `H` | Toggle the help overlay |
 | `Esc` | Cancel a mode / deselect |
 | `R` | Restart (after the game ends) |
+
+## Replays
+
+Every finished match (10 seconds or longer) is **saved automatically** to
+`replays/` — pick **Replays** in the main menu to re-watch one. The trick is
+the same one multiplayer runs on: the sim is deterministic, so a replay is just
+the match seed plus every command stamped with the step it landed on — a few
+kilobytes for a whole battle. Playback re-runs the actual simulation:
+
+- **Space** pauses; **1–4** set the speed (1× / 2× / 4× / 16×).
+- **F** toggles the fog: watch all-seeing, or drop into the recorder's own fog
+  and see the match as they saw it.
+- **V** (versus recordings) cycles which faction's fog you're looking through.
+- The camera is yours: pan, edge-scroll, minimap-jump as usual.
+
+When the replay ends you get the result plus **match graphs** — each faction's
+army value and minerals mined over time (the same graphs appear on every
+end-of-match screen).
+
+## Watch AI battles
+
+**Watch AI Battle** in the main menu runs an all-AI exhibition — 2–4 rolled
+personalities fight it out while you observe with the full replay control set
+(speeds, pause, fog, viewpoints). Handy for scouting how the AI plays, or as a
+very small screensaver with explosions.
 
 ## Multiplayer — serverless lockstep
 
@@ -156,11 +182,15 @@ host is always blue).
 cargo run --release
 ```
 
-The game opens to a menu: **Single Player**, **Host Game**, **Join Game**,
-**Quit** — navigate by mouse or the number keys. Pause (`Esc`) and the
-end-of-match screen both offer a route back to the menu, so you can play match
-after match without relaunching. Add `--windowed` for a normal window instead
-of fullscreen.
+The game opens to a menu: **Single Player**, **Watch AI Battle**, **Replays**,
+**Host Game**, **Join Game**, **Quit** — navigate by mouse or the number keys.
+Pause (`Esc`) and the end-of-match screen both offer a route back to the menu,
+so you can play match after match without relaunching. Add `--windowed` for a
+normal window instead of fullscreen.
+
+Everything bright — tracers, explosions, mineral crystal, muzzle embers —
+bleeds a soft phosphor **glow** (a software bloom pass, ~3 ms a frame).
+`--no-bloom` switches it off if you're on weak hardware.
 
 Runs on **Linux, Windows, and macOS**. It's still a single windowing dependency
 (`minifb`) plus `cpal` for audio — no engine, no GPU. The only platform-specific

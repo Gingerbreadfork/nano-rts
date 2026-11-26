@@ -24,19 +24,21 @@ const PONG_MAGIC: &[u8] = b"NANORTS-HERE!"; // followed by 2-byte LE tcp port
 
 // ---- tiny byte writer/reader ----------------------------------------------
 
+// Crate-visible because the replay recorder reuses this codec, so a replay
+// file's command records are byte-identical to the wire's.
 #[derive(Default)]
-struct Buf(Vec<u8>);
+pub(crate) struct Buf(pub(crate) Vec<u8>);
 impl Buf {
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.0.push(v);
     }
     fn u16(&mut self, v: u16) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    fn u32(&mut self, v: u32) {
+    pub(crate) fn u32(&mut self, v: u32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
-    fn u64(&mut self, v: u64) {
+    pub(crate) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn f32(&mut self, v: f32) {
@@ -44,12 +46,12 @@ impl Buf {
     }
 }
 
-struct Rdr<'a> {
+pub(crate) struct Rdr<'a> {
     b: &'a [u8],
     p: usize,
 }
 impl<'a> Rdr<'a> {
-    fn new(b: &'a [u8]) -> Rdr<'a> {
+    pub(crate) fn new(b: &'a [u8]) -> Rdr<'a> {
         Rdr { b, p: 0 }
     }
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -61,16 +63,19 @@ impl<'a> Rdr<'a> {
             None
         }
     }
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn done(&self) -> bool {
+        self.p >= self.b.len()
+    }
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         self.take(1).map(|s| s[0])
     }
     fn u16(&mut self) -> Option<u16> {
         self.take(2).map(|s| u16::from_le_bytes([s[0], s[1]]))
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         self.take(4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         self.take(8)
             .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
     }
@@ -98,7 +103,7 @@ fn dec_ids(r: &mut Rdr) -> Option<Vec<u32>> {
     Some(v)
 }
 
-fn enc_cmd(buf: &mut Buf, c: &Cmd) {
+pub(crate) fn enc_cmd(buf: &mut Buf, c: &Cmd) {
     match c {
         Cmd::Order { ids, x, y, attack_move, queue } => {
             buf.u8(1);
@@ -140,7 +145,7 @@ fn enc_cmd(buf: &mut Buf, c: &Cmd) {
         }
     }
 }
-fn dec_cmd(r: &mut Rdr) -> Option<Cmd> {
+pub(crate) fn dec_cmd(r: &mut Rdr) -> Option<Cmd> {
     Some(match r.u8()? {
         1 => Cmd::Order {
             ids: dec_ids(r)?,
@@ -189,7 +194,7 @@ enum Msg {
 pub fn pack_teams(alliance: &[u8; MAXF]) -> u8 {
     (0..MAXF).fold(0u8, |b, f| b | ((alliance[f] & 3) << (f * 2)))
 }
-fn unpack_teams(b: u8) -> [u8; MAXF] {
+pub(crate) fn unpack_teams(b: u8) -> [u8; MAXF] {
     let mut a = [0u8; MAXF];
     for (f, slot) in a.iter_mut().enumerate() {
         *slot = (b >> (f * 2)) & 3;

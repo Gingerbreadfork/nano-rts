@@ -385,6 +385,199 @@ impl Canvas {
     }
 }
 
+// ---- bloom ------------------------------------------------------------------
+//
+// A post-process glow in integer math: downsample what clears a luma threshold,
+// box-blur the small buffer, then upsample and add it back over the frame.
+
+const BLOOM_SCALE: usize = 4; // downsample factor
+// Luma below which nothing glows, on a 0..255 scale. Must stay >= 128: the
+// downsample rejects dark pixels with a `p & 0x808080` test that assumes it.
+const BLOOM_THRESHOLD: u32 = 168;
+const BLOOM_STRENGTH: u32 = 150; // /256 gain applied to the brightpass
+
+/// Reusable bloom pass. Its scratch buffers are rebuilt only when the canvas
+/// size changes, so applying it each frame allocates nothing.
+pub struct Bloom {
+    cw: usize, // canvas size the buffers currently match
+    ch: usize,
+    w: usize, // downsampled size
+    h: usize,
+    a: Vec<u32>, // brightpass and blur ping-pong buffers, packed 00RRGGBB
+    b: Vec<u32>,
+    xmap: Vec<(usize, usize, u32)>, // per canvas column: (i0, i1, fx 0..=256)
+    row0: Vec<u32>, // bilinear-expanded small rows cached for the composite
+    row1: Vec<u32>,
+}
+
+/// Bilinear helper: per-channel `(c0*(256-f) + c1*f) >> 8` on packed pixels.
+#[inline]
+fn lerp_px(p0: u32, p1: u32, f: u32) -> u32 {
+    let inv = 256 - f;
+    let r = (((p0 >> 16) & 0xFF) * inv + ((p1 >> 16) & 0xFF) * f) >> 8;
+    let g = (((p0 >> 8) & 0xFF) * inv + ((p1 >> 8) & 0xFF) * f) >> 8;
+    let b = ((p0 & 0xFF) * inv + (p1 & 0xFF) * f) >> 8;
+    (r << 16) | (g << 8) | b
+}
+
+/// One 5-tap box-blur pass over the small buffer, edge-replicated. Keeps a
+/// sliding window sum, one pixel in and one out, instead of five taps each.
+fn box_pass(src: &[u32], dst: &mut [u32], w: usize, h: usize, horiz: bool) {
+    let (len, n, stride) = if horiz { (w, h, 1) } else { (h, w, w) };
+    let li = len as i32;
+    for lane in 0..n {
+        let base = if horiz { lane * w } else { lane };
+        let at = |i: i32| -> u32 { src[base + i.clamp(0, li - 1) as usize * stride] };
+        let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
+        for i in -2..=2 {
+            let p = at(i);
+            r += ((p >> 16) & 0xFF) as i32;
+            g += ((p >> 8) & 0xFF) as i32;
+            b += (p & 0xFF) as i32;
+        }
+        for i in 0..len {
+            dst[base + i * stride] = ((r as u32 / 5) << 16) | ((g as u32 / 5) << 8) | (b as u32 / 5);
+            let out = at(i as i32 - 2);
+            let inp = at(i as i32 + 3);
+            r += ((inp >> 16) & 0xFF) as i32 - ((out >> 16) & 0xFF) as i32;
+            g += ((inp >> 8) & 0xFF) as i32 - ((out >> 8) & 0xFF) as i32;
+            b += (inp & 0xFF) as i32 - (out & 0xFF) as i32;
+        }
+    }
+}
+
+impl Bloom {
+    pub fn new() -> Bloom {
+        Bloom { cw: 0, ch: 0, w: 0, h: 0, a: Vec::new(), b: Vec::new(), xmap: Vec::new(), row0: Vec::new(), row1: Vec::new() }
+    }
+
+    /// Rebuild the scratch buffers when the canvas size differs from `cw` x `ch`.
+    fn ensure(&mut self, cw: usize, ch: usize) {
+        if self.cw == cw && self.ch == ch {
+            return;
+        }
+        self.cw = cw;
+        self.ch = ch;
+        self.w = cw.div_ceil(BLOOM_SCALE).max(2);
+        self.h = ch.div_ceil(BLOOM_SCALE).max(2);
+        self.a = vec![0; self.w * self.h];
+        self.b = vec![0; self.w * self.h];
+        self.row0 = vec![0; cw];
+        self.row1 = vec![0; cw];
+        // Upsample x-mapping: which two small columns each canvas column
+        // blends, and the 8.8 fixed-point weight between them.
+        self.xmap = (0..cw)
+            .map(|x| {
+                let pos = (x as i32 * 256 + 128) / BLOOM_SCALE as i32 - 128;
+                let pos = pos.max(0) as usize;
+                let i0 = (pos >> 8).min(self.w - 1);
+                (i0, (i0 + 1).min(self.w - 1), (pos & 255) as u32)
+            })
+            .collect();
+    }
+
+    /// Expand small row `r` to canvas width with horizontal bilinear.
+    /// Returns whether anything in the row glows at all.
+    fn expand(a: &[u32], xmap: &[(usize, usize, u32)], w: usize, r: usize, dst: &mut [u32]) -> bool {
+        let base = r * w;
+        let mut any = 0u32;
+        for (d, &(i0, i1, f)) in dst.iter_mut().zip(xmap.iter()) {
+            *d = lerp_px(a[base + i0], a[base + i1], f);
+            any |= *d;
+        }
+        any != 0
+    }
+
+    /// Apply the glow to a frame in place.
+    pub fn apply(&mut self, c: &mut Canvas) {
+        let (cw, ch) = (c.w as usize, c.h as usize);
+        if cw < BLOOM_SCALE * 2 || ch < BLOOM_SCALE * 2 {
+            return;
+        }
+        self.ensure(cw, ch);
+        let (w, h) = (self.w, self.h);
+
+        // 1. Downsample and threshold. Each pixel is thresholded before the
+        // block is averaged, so a single hot pixel still deposits its light.
+        for gy in 0..h {
+            let y0 = gy * BLOOM_SCALE;
+            let y1 = (y0 + BLOOM_SCALE).min(ch);
+            for gx in 0..w {
+                let x0 = gx * BLOOM_SCALE;
+                let x1 = (x0 + BLOOM_SCALE).min(cw);
+                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                for yy in y0..y1 {
+                    let row = yy * cw;
+                    for &p in &c.buf[row + x0..row + x1] {
+                        if p & 0x0080_8080 == 0 {
+                            continue; // every channel < 128, so luma < 128 <= threshold
+                        }
+                        let (pr, pg, pb) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);
+                        let luma = (pr * 54 + pg * 183 + pb * 19) >> 8;
+                        if luma > BLOOM_THRESHOLD {
+                            let k = (luma - BLOOM_THRESHOLD) * 256 / (255 - BLOOM_THRESHOLD); // 0..=256 knee
+                            r += (pr * k) >> 8;
+                            g += (pg * k) >> 8;
+                            b += (pb * k) >> 8;
+                        }
+                    }
+                }
+                let n = ((x1 - x0) * (y1 - y0)) as u32;
+                // Strength may exceed unity, so clamp each channel to a byte.
+                let r = (r * BLOOM_STRENGTH / (n << 8)).min(255);
+                let g = (g * BLOOM_STRENGTH / (n << 8)).min(255);
+                let b = (b * BLOOM_STRENGTH / (n << 8)).min(255);
+                self.a[gy * w + gx] = (r << 16) | (g << 8) | b;
+            }
+        }
+
+        // 2. Two box-blur rounds, horizontal then vertical, for a soft halo.
+        for _ in 0..2 {
+            box_pass(&self.a, &mut self.b, w, h, true);
+            box_pass(&self.b, &mut self.a, w, h, false);
+        }
+
+        // 3. Bilinear upsample, added over the frame with saturation. The two
+        // small rows in play are expanded once and reused until they change.
+        let mut cached: i32 = -1;
+        let (mut lit0, mut lit1) = (false, false);
+        for y in 0..ch {
+            let pos = (y as i32 * 256 + 128) / BLOOM_SCALE as i32 - 128;
+            let pos = pos.max(0) as usize;
+            let r0 = (pos >> 8).min(h - 1);
+            let fy = (pos & 255) as u32;
+            let r1 = (r0 + 1).min(h - 1);
+            if r0 as i32 != cached {
+                lit0 = Bloom::expand(&self.a, &self.xmap, w, r0, &mut self.row0);
+                lit1 = Bloom::expand(&self.a, &self.xmap, w, r1, &mut self.row1);
+                cached = r0 as i32;
+            }
+            if !lit0 && !lit1 {
+                continue; // this whole stripe of the frame has no glow
+            }
+            let row = y * cw;
+            for x in 0..cw {
+                let (p0, p1) = (self.row0[x], self.row1[x]);
+                if p0 | p1 == 0 {
+                    continue; // nothing glowing here
+                }
+                let glow = lerp_px(p0, p1, fy);
+                let bg = c.buf[row + x];
+                let r = (((bg >> 16) & 0xFF) + ((glow >> 16) & 0xFF)).min(255);
+                let g = (((bg >> 8) & 0xFF) + ((glow >> 8) & 0xFF)).min(255);
+                let b = ((bg & 0xFF) + (glow & 0xFF)).min(255);
+                c.buf[row + x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+
+impl Default for Bloom {
+    fn default() -> Bloom {
+        Bloom::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +640,85 @@ mod tests {
                 }
             }
             assert_eq!(a.buf, b.buf, "circle at ({cx},{cy}) diverged");
+        }
+    }
+
+    /// The sliding-window blur must reproduce the naive edge-clamped 5-tap
+    /// box filter exactly, both directions, including the edges.
+    #[test]
+    fn box_pass_matches_naive_reference() {
+        let (w, h) = (13usize, 7usize);
+        let src: Vec<u32> = (0..w * h)
+            .map(|i| {
+                let x = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                (x >> 24) as u32 & 0x00FF_FFFF
+            })
+            .collect();
+        for horiz in [true, false] {
+            let mut fast = vec![0; w * h];
+            box_pass(&src, &mut fast, w, h, horiz);
+            let mut naive = vec![0; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                    for d in -2i32..=2 {
+                        let (sx, sy) = if horiz {
+                            ((x as i32 + d).clamp(0, w as i32 - 1) as usize, y)
+                        } else {
+                            (x, (y as i32 + d).clamp(0, h as i32 - 1) as usize)
+                        };
+                        let p = src[sy * w + sx];
+                        r += (p >> 16) & 0xFF;
+                        g += (p >> 8) & 0xFF;
+                        b += p & 0xFF;
+                    }
+                    naive[y * w + x] = ((r / 5) << 16) | ((g / 5) << 8) | (b / 5);
+                }
+            }
+            assert_eq!(fast, naive, "horiz={horiz}");
+        }
+    }
+
+    /// A bright block must bleed light onto nearby dark pixels, leave far
+    /// pixels untouched, and never darken the source.
+    #[test]
+    fn bloom_spreads_bright_light() {
+        let mut c = Canvas::new(96, 96);
+        c.clear(rgb(10, 10, 10));
+        c.fill_rect(44, 44, 8, 8, rgb(255, 255, 255));
+        let mut bl = Bloom::new();
+        bl.apply(&mut c);
+        // Just outside the block: glow landed.
+        let near = c.buf[48 * 96 + 58];
+        assert!(near & 0xFF > 10, "near pixel should be lit by glow, got {near:08x}");
+        // A far corner: unchanged.
+        assert_eq!(c.buf[5 * 96 + 5], rgb(10, 10, 10), "far pixel must not change");
+        // The source block itself stays fully bright.
+        assert_eq!(c.buf[48 * 96 + 48], rgb(255, 255, 255));
+    }
+
+    /// A frame with nothing over the threshold passes through untouched.
+    #[test]
+    fn bloom_ignores_dim_scenes() {
+        let mut c = Canvas::new(64, 48);
+        c.clear(rgb(60, 70, 80));
+        c.fill_rect(10, 10, 20, 20, rgb(120, 90, 100));
+        let before = c.buf.clone();
+        let mut bl = Bloom::new();
+        bl.apply(&mut c);
+        assert_eq!(c.buf, before, "below-threshold content must not glow");
+    }
+
+    /// Sizes that are not multiples of the downsample factor, and reuse
+    /// across a resize, must not panic or index out of bounds.
+    #[test]
+    fn bloom_survives_odd_sizes_and_resizes() {
+        let mut bl = Bloom::new();
+        for &(w, h) in &[(33, 17), (129, 71), (640, 360), (7, 7), (1281, 721)] {
+            let mut c = Canvas::new(w, h);
+            c.clear(rgb(0, 0, 0));
+            c.fill_rect(w / 3, h / 3, 6, 6, rgb(255, 240, 200));
+            bl.apply(&mut c);
         }
     }
 
